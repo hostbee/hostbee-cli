@@ -14,10 +14,39 @@ cargo build                    # 开发构建：target/debug/hostbee
 
 `Cargo.lock` 随仓库提交（二进制 crate，保证可复现构建）。
 
+## codegen 命令面
+
+命令面按 `vendor/backend/rustybee/schema.graphql` 全量生成：210 个 root field →
+按领域分组的两层子命令（Query/Mutation 混排），参数 → flags，结果与 GraphQL 返回
+JSON 同构。设计决策见 [docs/adr/0002-命令面全量-codegen.md](docs/adr/0002-命令面全量-codegen.md)。
+
+```sh
+hostbee vm --help                       # 领域组内前缀发现全部命令
+hostbee vm vm-instances --page-size 1  # 分页查询：默认 25/1/filter {}
+hostbee vm list                         # 手写别名 → vm vm-instances
+hostbee vm update-vm-instance --input '{"id":608,"rootPassword":"x"}'
+                                        # 输入对象整体 JSON 透传
+hostbee vm vm-instances --depth 8      # selection set 展开深度 0..=8，默认 3
+hostbee vm vm-instances --fields '{ nodes { id status } totalNum }'
+                                        # 完全覆盖生成的 selection set
+```
+
+- **接线范围**：生成器产物覆盖全部 210 个 root field（`login`/`refresh` 由 auth.rs
+  手写实现除外）；当前 CLI 只接线 `vm` 领域（ticket #4 tracer），其余 17 个领域组
+  在 `crates/hostbee/src/commands.rs` 的 `ENABLED_DOMAINS` 中逐组开启（ticket #5，
+  每个领域一行）。
+- **分页**：默认单页。`pageSize/pageNum` 风格 CLI 默认 `--page-size 25`/`--page-num 1`；
+  游标风格 CLI 默认 `--first 25`（`--after`/`--before`/`--last` 可选）。输出保留
+  schema 中的分页元数据（`totalNum` / `pageInfo` / `totalCount`）。
+- **产物再生成**：schema 更新后运行 `cargo run -p hostbee-codegen`，产物
+  （`crates/hostbee/src/generated/{mod.rs,docs.rs}`）commit 进仓库，重跑幂等。
+  产物头部带 schema sha256 漂移标记，`cargo test` 会校验并提示重跑。
+  **前提**：`vendor/backend/rustybee` 子模块须初始化（`git submodule update --init`）。
+- 手写别名表（`vm list`、`vm search`）在 `commands.rs` 的 `ALIASES`，不进 codegen 规则。
+
 ## gql 逃生门
 
-命令面将按 `vendor/backend/rustybee/schema.graphql` 全量 codegen 生成（ticket #4）；
-在 codegen 覆盖不到的窗口期，用 `gql` 逃生门透传任意 GraphQL document：
+schema 演进快于本仓库发布时的兜底：任意 GraphQL document 原样透传，
 
 ```sh
 hostbee gql '{ backendVersion { version commitHash buildTime } }' --endpoint http://127.0.0.1:8000
@@ -223,6 +252,11 @@ e2e 测试完全 hermetic（内存 stub server），hook 不访问 localhost 以
   daemon/systemd 侧含 interval 校验、退避曲线、UTC 时间戳向量、保活轮状态机
   （脚本化传输）、unit 文件 golden、systemd 检测/PATH 查找、假 systemctl 脚本驱动的
   完整安装流程（幂等重装、失败汇总）。
+- **codegen 产物断言**（`crates/hostbee/tests/codegen_product.rs`）：schema sha256
+  漂移标记（schema 变更后提示重跑生成器）、208 命令全量结构断言（领域分组与
+  schema-survey 目录一致、vm 组 12 命令）、208×9 document 全量 `parse_query`
+  可解析、`--fields` 拼接路径可解析、tracer（vmInstances）默认 document 逐字节
+  快照、展开尺寸预算。
 - **e2e**（`crates/hostbee/tests/e2e/`，`cargo test --test e2e`）：全仓库唯一的「高 seam」，
   进程边界测试。测试内起内存 stub GraphQL HTTP server（tiny_http，dev-dep），spawn
   编译好的真实二进制（`env!("CARGO_BIN_EXE_hostbee")`）指向它，断言 stdout JSON、
@@ -239,18 +273,21 @@ e2e 测试完全 hermetic（内存 stub server），hook 不访问 localhost 以
 
 ```
 Cargo.toml               # workspace 根（resolver = 3）
-crates/hostbee/          # 唯一成员：hostbee CLI（lib + bin）
+crates/hostbee/          # CLI（lib + bin）
   src/
-    lib.rs               # 模块入口（endpoint / error / gql / auth / config / daemon / systemd）
+    lib.rs               # 模块入口（commands / generated / endpoint / error / gql / auth / config / daemon / systemd）
     main.rs              # 二进制入口：clap 解析 + stdin/stdout 编排
+    commands.rs          # codegen 命令面运行时：注册表类型、clap 构建、--depth/--fields、执行接线
+    generated/           # codegen 产物（commit 进仓库）：mod.rs 注册表 + docs.rs document 常量
     auth.rs              # token 生命周期状态机（401 判定 / refresh 轮换 / 密码重登 / TOTP）
     config.rs            # ~/.hostbee/config.toml 读写（原子写）
     daemon.rs            # daemon 保活循环（周期轮换 / 退避 / 信号退出 / systemd 安装编排）
     systemd.rs           # systemd user unit 生成与安装（检测 / PATH 查找 / systemctl 调用）
   tests/e2e/             # e2e harness（stub server + 三通道断言 + daemon 子进程场景）
+  tests/codegen_product.rs  # 产物断言：sha256 漂移 / 结构 / parse_query / 快照
+crates/hostbee-codegen/  # 生成器 bin：schema.graphql → generated/{mod,docs}.rs
 .githooks/pre-push       # 质量门禁 hook
 vendor/                  # 后端与 webclient 子模块（只读参考，禁止修改）
 ```
 
-后续 codegen crate（schema.graphql → 命令面生成器，ticket #4）将作为新成员加入
-`crates/`；daemon 保活（ticket #6）在 `hostbee` crate 内扩展。
+daemon 保活（ticket #6）在 `hostbee` crate 内扩展。

@@ -5,7 +5,8 @@ edition = "2024"
 description = "rustybee 后端的 agent 专用 CLI 客户端"
 
 [dependencies]
-clap = { version = "4", features = ["derive"] }
+# string 特性：运行期生成的 flag/值名走 String（clap 4.6 起 From<String> 按特性门控）
+clap = { version = "4", features = ["derive", "string"] }
 # daemon 的 SIGINT/SIGTERM 处理（termination feature 一并覆盖 SIGTERM/SIGHUP）：
 # 常驻循环收到信号后干净退出（exit 0），其余命令为短进程，不涉及
 ctrlc = { version = "3", features = ["termination"] }
@@ -20,6 +21,8 @@ toml = "0.9"
 ureq = { version = "3", default-features = false, features = ["json", "rustls"] }
 
 [dev-dependencies]
-# e2e harness 的内存 stub GraphQL server（见 tests/e2e/）
+# 产物断言（tests/codegen_product.rs）：重解析 schema、parse_query 校验生成 document
+async-graphql-parser = "7.2.1"
+# e2e harness 的内存 stub GraphQL HTTP server（见 tests/e2e/）
 tiny_http = "0.12"
 tempfile = "3"

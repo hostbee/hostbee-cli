@@ -1,0 +1,13 @@
+[package]
+name = "hostbee-codegen"
+version = "0.1.0"
+edition = "2024"
+description = "命令面生成器：解析 vendored schema.graphql，生成 hostbee 的全量命令面产物"
+publish = false
+
+[dependencies]
+# 与后端 async-graphql 7.x 同家族的 SDL 解析器（选型见 spec-notes/codegen-design.md §2.1）
+async-graphql-parser = "7.2.1"
+clap = { version = "4", default-features = false, features = ["std", "help", "usage", "error-context"] }
+# schema sha256 漂移标记（产物头部注释 + mod.rs 常量，hostbee 侧 unit 测试校验）
+sha2 = "0.10"
