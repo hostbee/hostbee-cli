@@ -1,9 +1,17 @@
-//! gql 逃生门：把任意 GraphQL document 原样 POST 到 `<endpoint>/graphql`，
-//! 按输出契约处理 GraphQL envelope（成功 → data 值；errors 非空/非 2xx/传输失败 → [`CliError`]）。
+//! GraphQL 请求传输层与 envelope 分类。
+//!
+//! [`GraphqlTransport`] 把「POST `<endpoint>/graphql` + 可选 `HB-AUTH` 头」抽象成
+//! 一个纯函数式接口：真实实现是 [`UreqTransport`]（ureq），unit 测试用脚本化实现
+//! 驱动 [`crate::auth`] 的 token 生命周期状态机，不打真实网络。
+//!
+//! [`parse_response`] 按输出契约分类响应（纯函数，便于 unit 测试）。
 
 use serde_json::{Value, json};
 
 use crate::error::CliError;
+
+/// 认证头名称：后端只认 `HB-AUTH: Bearer <accessToken>`（schema 见 webclient 一致行为）。
+pub const AUTH_HEADER: &str = "HB-AUTH";
 
 /// `<endpoint>/graphql` 拼接；endpoint 尾部多余的 `/` 去掉，避免 `//graphql`。
 pub fn graphql_url(endpoint: &str) -> String {
@@ -15,34 +23,58 @@ pub fn parse_variables(raw: &str) -> Result<Value, CliError> {
     serde_json::from_str(raw).map_err(|e| CliError::InvalidVariables(e.to_string()))
 }
 
-/// 执行 GraphQL 请求：document 原样透传（不做任何改写），variables 可选。
-/// 成功返回 envelope 中 `data` 的值（可能为 null）。
-pub fn execute(
-    endpoint: &str,
-    document: &str,
-    variables: Option<Value>,
-) -> Result<Value, CliError> {
-    let url = graphql_url(endpoint);
+/// 组装 GraphQL 请求 body：`{"query": doc, "variables": ...}`。
+pub fn request_body(document: &str, variables: Option<Value>) -> Value {
     let mut body = json!({ "query": document });
     if let Some(variables) = variables {
         body["variables"] = variables;
     }
-    // 关闭 ureq「非 2xx 即 Err」的默认行为，拿到完整响应后按输出契约自行分类，
-    // 这样非 2xx 时仍能读取 body 组装 errors。
-    let agent: ureq::Agent = ureq::Agent::config_builder()
-        .http_status_as_error(false)
-        .build()
-        .into();
-    let mut response = agent
-        .post(&url)
-        .send_json(&body)
-        .map_err(|e| CliError::Transport(e.to_string()))?;
-    let status = response.status().as_u16();
-    let text = response
-        .body_mut()
-        .read_to_string()
-        .map_err(|e| CliError::Transport(format!("读取响应 body 失败: {e}")))?;
-    parse_response(status, &text)
+    body
+}
+
+/// 一次 GraphQL HTTP 请求的抽象。
+///
+/// - `endpoint`：base URL（内部拼 `/graphql`）；
+/// - `auth`：非空时携带 `HB-AUTH: Bearer <auth>`；
+/// - 返回 `(HTTP status, body 文本)`；传输层失败（连接拒绝等）返回 Err。
+pub trait GraphqlTransport {
+    fn post(
+        &self,
+        endpoint: &str,
+        auth: Option<&str>,
+        body: &Value,
+    ) -> Result<(u16, String), String>;
+}
+
+/// ureq 实现（同步、阻塞式；选型见 README）。
+pub struct UreqTransport;
+
+impl GraphqlTransport for UreqTransport {
+    fn post(
+        &self,
+        endpoint: &str,
+        auth: Option<&str>,
+        body: &Value,
+    ) -> Result<(u16, String), String> {
+        let url = graphql_url(endpoint);
+        // 关闭 ureq「非 2xx 即 Err」的默认行为，拿到完整响应后按输出契约自行分类，
+        // 这样非 2xx 时仍能读取 body 组装 errors。
+        let agent: ureq::Agent = ureq::Agent::config_builder()
+            .http_status_as_error(false)
+            .build()
+            .into();
+        let mut request = agent.post(&url);
+        if let Some(token) = auth {
+            request = request.header(AUTH_HEADER, format!("Bearer {token}"));
+        }
+        let mut response = request.send_json(body).map_err(|e| e.to_string())?;
+        let status = response.status().as_u16();
+        response
+            .body_mut()
+            .read_to_string()
+            .map(|text| (status, text))
+            .map_err(|e| format!("读取响应 body 失败: {e}"))
+    }
 }
 
 /// 按输出契约分类响应（纯函数，便于 unit 测试）：
@@ -105,6 +137,15 @@ mod tests {
     }
 
     #[test]
+    fn 请求体_无变量时不带_variables_键() {
+        assert_eq!(request_body("{ x }", None), json!({ "query": "{ x }" }));
+        assert_eq!(
+            request_body("{ x }", Some(json!({"a": 1}))),
+            json!({ "query": "{ x }", "variables": {"a": 1} })
+        );
+    }
+
+    #[test]
     fn 成功响应返回_data_值() {
         let text = r#"{"data":{"backendVersion":{"version":"0.12.3"}}}"#;
         assert_eq!(
@@ -160,13 +201,22 @@ mod tests {
     }
 
     #[test]
-    fn 非_2xx_无_errors_数组时按状态码报错() {
-        let err = parse_response(401, r#"{"error":"unauthorized"}"#).unwrap_err();
-        assert!(matches!(err, CliError::HttpStatus { status: 401, .. }));
+    fn 认证失败的_400_与_真实_401_都可被识别() {
+        // 本地后端真实形状：受保护字段未授权 → HTTP 400 + extensions.status 401
+        let text = r#"{"data":null,"errors":[{"message":"未登录或登录已失效。","extensions":{"code":"auth.unauthorized","status":401}}]}"#;
+        assert!(matches!(
+            parse_response(400, text),
+            Err(CliError::GraphQlErrors(_))
+        ));
+        // 代理/网关也可能直接给 HTTP 401
+        assert!(matches!(
+            parse_response(401, r#"{"error":"unauthorized"}"#),
+            Err(CliError::HttpStatus { status: 401, .. })
+        ));
     }
 
     #[test]
-    fn 非_2xx_状态码失败() {
+    fn 非_2xx_无_errors_数组时按状态码报错() {
         let err = parse_response(502, "Bad Gateway").unwrap_err();
         assert!(matches!(err, CliError::HttpStatus { status: 502, .. }));
     }
