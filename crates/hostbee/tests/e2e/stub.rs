@@ -7,9 +7,12 @@
 //!   （HTTP 400 + `extensions.status=401`，后端不发 HTTP 401）、`login` 只发 login token、
 //!   `verifyTotp` 交换 token 对、`refresh` 轮换（旧 refreshToken 即废）、
 //!   错误密码 / 旧 refreshToken 复用 → 500 `messages.internal_error`。
+//!   附带故障开关 [`GraphqlStub::set_outage`]：开启时 login/verifyTotp/refresh 一律
+//!   500（模拟后端不可用，驱动 daemon 退避与恢复路径）。
 //!
 //! 同时捕获每个请求的 Content-Type、HB-AUTH 头与 body，供测试断言请求形状。
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
@@ -33,6 +36,8 @@ enum Mode {
     Auth {
         config: AuthStubConfig,
         state: Arc<Mutex<AuthState>>,
+        /// 认证 mutation 故障开关：true 时 login/verifyTotp/refresh 一律 500。
+        outage: Arc<AtomicBool>,
     },
 }
 
@@ -63,6 +68,7 @@ pub struct GraphqlStub {
     url: String,
     requests: Arc<Mutex<Vec<CapturedRequest>>>,
     auth_state: Option<Arc<Mutex<AuthState>>>,
+    outage: Option<Arc<AtomicBool>>,
 }
 
 impl GraphqlStub {
@@ -90,7 +96,12 @@ impl GraphqlStub {
             refresh_count: 0,
             totp_count: 0,
         }));
-        Self::start(Mode::Auth { config, state })
+        let outage = Arc::new(AtomicBool::new(false));
+        Self::start(Mode::Auth {
+            config,
+            state,
+            outage,
+        })
     }
 
     /// stub 的 base URL（传给 hostbee 的 endpoint）。
@@ -108,6 +119,14 @@ impl GraphqlStub {
         self.auth_state.as_ref().map(|s| s.lock().unwrap().clone())
     }
 
+    /// 认证后端故障开关（仅 auth 模式）：true = login/verifyTotp/refresh 一律 500，
+    /// false = 恢复正常。驱动 daemon 的退避与恢复路径。
+    pub fn set_outage(&self, down: bool) {
+        if let Some(outage) = &self.outage {
+            outage.store(down, Ordering::SeqCst);
+        }
+    }
+
     fn start(mode: Mode) -> Self {
         let server = tiny_http::Server::http("127.0.0.1:0").expect("stub server 绑定失败");
         let url = format!("http://{}", server.server_addr());
@@ -115,6 +134,10 @@ impl GraphqlStub {
         let shared = requests.clone();
         let auth_state = match &mode {
             Mode::Auth { state, .. } => Some(state.clone()),
+            _ => None,
+        };
+        let outage = match &mode {
+            Mode::Auth { outage, .. } => Some(outage.clone()),
             _ => None,
         };
         thread::spawn(move || {
@@ -147,6 +170,7 @@ impl GraphqlStub {
             url,
             requests,
             auth_state,
+            outage,
         }
     }
 }
@@ -236,12 +260,23 @@ fn respond(mode: &Mode, body: &str, hb_auth: Option<&str>) -> (u16, String) {
             });
             (200, serde_json::to_string(&resp).unwrap())
         }
-        Mode::Auth { config, state } => {
+        Mode::Auth {
+            config,
+            state,
+            outage,
+        } => {
             let mut state = state.lock().unwrap();
             let parsed: Value = serde_json::from_str(body).unwrap_or(Value::Null);
             let query = parsed.get("query").and_then(Value::as_str).unwrap_or("");
             let variables = parsed.get("variables");
-            if query.contains("login(contact") {
+            // 故障开关：认证 mutation 一律 500（真实后端瞬态故障/重启的等价模拟）。
+            // 受保护查询不受影响——已签发的 access token 独立有效。
+            let auth_mutation = query.contains("login(contact")
+                || query.contains("verifyTotp(")
+                || query.contains("refresh(refreshToken");
+            if outage.load(Ordering::SeqCst) && auth_mutation {
+                (500, shape::internal_error())
+            } else if query.contains("login(contact") {
                 let contact = variables
                     .and_then(|v| v.get("contact"))
                     .and_then(Value::as_str);

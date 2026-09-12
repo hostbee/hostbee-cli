@@ -312,7 +312,9 @@ fn retry_with_pair<T: GraphqlTransport>(
     pair: AuthPair,
     body: &Value,
 ) -> Result<Value, CliError> {
-    persist_pair(session, &pair);
+    if let Err(e) = persist_pair(session, &pair) {
+        eprintln!("警告：{e}——新 token 仅本次调用有效，下次调用将重新恢复会话");
+    }
     session.access_token = Some(pair.access_token);
     let retry = send(transport, session, body);
     if matches!(&retry, Err(err) if is_auth_failure(err)) {
@@ -350,11 +352,12 @@ fn post_pair<T: GraphqlTransport>(
 }
 
 /// 原子落盘新 token 对（保留 config 中已有的账号信息）。
-/// 拿不到 home 目录时静默跳过（CI/容器：token 仅本次调用有效）；
-/// 写盘失败只警告不中断——调用本身已可成功，下次调用走恢复路径。
-fn persist_pair(session: &Session, pair: &AuthPair) {
+/// 拿不到 home 目录时静默跳过（CI/容器：token 仅本次调用有效）视为成功；
+/// 写盘失败返回 Err 由调用方决定日志——CLI 路径只警告不中断（调用本身已可成功，
+/// 下次调用走恢复路径），daemon 路径据此计入退避。
+pub(crate) fn persist_pair(session: &Session, pair: &AuthPair) -> Result<(), String> {
     let Some(path) = &session.config_path else {
-        return;
+        return Ok(());
     };
     let config = Config {
         endpoint: Some(session.endpoint.clone()),
@@ -368,9 +371,7 @@ fn persist_pair(session: &Session, pair: &AuthPair) {
             .clone()
             .or_else(|| session.refresh_token.clone()),
     };
-    if let Err(e) = crate::config::write_config_atomic(path, &config) {
-        eprintln!("警告：{e}——新 token 仅本次调用有效，下次调用将重新恢复会话");
-    }
+    crate::config::write_config_atomic(path, &config)
 }
 
 /// 恢复全失败时的最终错误：原始认证错误的 errors 数组**原样透传**，

@@ -600,3 +600,297 @@ fn env_refresh_token_无本地凭据_也能完成_并尽力落盘() {
     assert_eq!(cfg.contact, None);
     assert_eq!(cfg.password, None);
 }
+
+// ========== daemon 保活（ticket #6） ==========
+
+use std::io::{BufRead, BufReader};
+use std::process::Stdio;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+/// 轮询等待条件成立（100ms 间隔）；超时返回最后一次求值结果。
+fn wait_until(timeout: Duration, mut cond: impl FnMut() -> bool) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if cond() {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return cond();
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// 运行中的 daemon 子进程：stderr 管道实时采集到共享缓冲，可随时断言日志。
+struct DaemonProc {
+    child: std::process::Child,
+    stderr_buf: Arc<Mutex<String>>,
+}
+
+impl DaemonProc {
+    /// spawn `hostbee daemon ...`（envs 必须含 HOME；stdout 丢弃——契约要求恒空）。
+    fn spawn(args: &[&str], envs: &[(&str, &str)]) -> Self {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_hostbee"))
+            .args(args)
+            .env_clear()
+            .envs(envs.iter().copied())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn hostbee daemon 失败");
+        let pipe = child.stderr.take().expect("daemon stderr 应为管道");
+        let stderr_buf = Arc::new(Mutex::new(String::new()));
+        let buf = stderr_buf.clone();
+        std::thread::spawn(move || {
+            let mut reader = BufReader::new(pipe);
+            let mut line = String::new();
+            loop {
+                line.clear();
+                match reader.read_line(&mut line) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => buf.lock().unwrap().push_str(&line),
+                }
+            }
+        });
+        DaemonProc { child, stderr_buf }
+    }
+
+    /// 目前为止采集到的 stderr 全文。
+    fn stderr(&self) -> String {
+        self.stderr_buf.lock().unwrap().clone()
+    }
+
+    /// SIGTERM 后等待干净退出（exit 0）；超时则 SIGKILL 并原样返回状态（断言会失败）。
+    /// 返回最终退出状态与补齐后的 stderr 全文（退出日志行可能略晚于 wait 返回）。
+    fn sigterm_and_wait(self, timeout: Duration) -> (std::process::ExitStatus, String) {
+        let mut child = self.child;
+        let buf = self.stderr_buf;
+        let pid = child.id().to_string();
+        let _ = Command::new("kill").arg("-TERM").arg(&pid).status();
+        let deadline = Instant::now() + timeout;
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                break child.wait().unwrap();
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        // 采集线程可能还有最后一两行未入缓冲，短暂等待补齐
+        let _ = wait_until(Duration::from_millis(500), || {
+            buf.lock().unwrap().contains("收到终止信号，退出")
+        });
+        (status, buf.lock().unwrap().clone())
+    }
+}
+
+/// 判定本机是否 systemd 环境（bare daemon 在 systemd 机器上会真实安装服务，
+/// 该场景的 e2e 只在无 systemd 机器上运行）。
+fn systemd_machine() -> bool {
+    Path::new("/run/systemd/system").is_dir()
+}
+
+#[test]
+fn daemon_前台保活_持续轮换_cli_全程可用_sigterm_干净退出() {
+    let stub = auth_stub(true);
+    let (_home, home_str, _) = do_login(&stub);
+    // 首轮立即执行（t=0），此后每 1s 一轮
+    let daemon = DaemonProc::spawn(
+        &["daemon", "--interval", "1", "--foreground"],
+        &[("HOME", home_str.as_str())],
+    );
+    assert!(
+        wait_until(Duration::from_secs(10), || {
+            stub.auth_state().unwrap().refresh_count >= 3
+        }),
+        "daemon 应完成至少 3 次轮换，实际 {}，stderr：{}",
+        stub.auth_state().unwrap().refresh_count,
+        daemon.stderr()
+    );
+
+    // 轮换期间并发跑普通 CLI 查询：全程可用（读最新落盘 token）
+    for _ in 0..3 {
+        let r = run_hostbee(&["gql", "{ me { id } }"], &[("HOME", home_str.as_str())]);
+        assert_eq!(r.code, Some(0), "daemon 运行期间 CLI 应可用: {}", r.stderr);
+        assert!(r.stdout.contains("\"me\""));
+    }
+
+    // SIGTERM：干净退出（exit 0 + 退出日志）
+    let (status, stderr) = daemon.sigterm_and_wait(Duration::from_secs(5));
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "SIGTERM 应干净退出，stderr：{stderr}"
+    );
+    assert!(
+        stderr.contains("refresh 轮换成功"),
+        "应记录轮换日志：{stderr}"
+    );
+    assert!(
+        stderr.contains("收到终止信号，退出"),
+        "应记录退出日志：{stderr}"
+    );
+    // 每行日志都带 [时间戳] 前缀
+    assert!(
+        stderr
+            .lines()
+            .all(|l| l.starts_with('[') || l.starts_with("警告")),
+        "daemon stderr 应全为带时间戳的日志行：{stderr}"
+    );
+
+    // 磁盘配置已轮换，且与 stub 服务端当前有效 refreshToken 一致（原子写无半更新）
+    let cfg = read_config(&home_str);
+    let state = stub.auth_state().unwrap();
+    assert_eq!(
+        cfg.refresh_token.as_deref(),
+        Some(state.refresh_token.as_str())
+    );
+    // daemon 只做 refresh：不触发密码重登（login 仍是 setup 那一次）
+    assert_eq!(state.login_count, 1);
+
+    // daemon 退出后 CLI 仍可用（token 对已持久化，不依赖 daemon 存活）
+    let r = run_hostbee(&["gql", "{ me { id } }"], &[("HOME", home_str.as_str())]);
+    assert_eq!(r.code, Some(0), "daemon 退出后 CLI 应仍可用: {}", r.stderr);
+}
+
+#[test]
+fn daemon_refresh_连续失败_退避日志_故障恢复后自愈() {
+    let stub = auth_stub(true);
+    let (_home, home_str, _) = do_login(&stub);
+    // 后端「挂掉」：认证 mutation 一律 500
+    stub.set_outage(true);
+    let daemon = DaemonProc::spawn(
+        &["daemon", "--interval", "1", "--foreground"],
+        &[("HOME", home_str.as_str())],
+    );
+    assert!(
+        wait_until(Duration::from_secs(10), || daemon.stderr().contains("退避")),
+        "失败应产生退避日志，stderr：{}",
+        daemon.stderr()
+    );
+    // 失败期间：配置未轮换（仍是 login 落盘的 refresh-1）、无成功轮换
+    let cfg = read_config(&home_str);
+    assert_eq!(cfg.refresh_token.as_deref(), Some("refresh-1"));
+    let state = stub.auth_state().unwrap();
+    assert_eq!(state.refresh_count, 0, "故障期间不应有成功轮换");
+    // 失败期间 CLI 仍可用：已落盘 access token 独立有效，daemon 故障不影响 CLI
+    let r = run_hostbee(&["gql", "{ me { id } }"], &[("HOME", home_str.as_str())]);
+    assert_eq!(r.code, Some(0), "故障期间 CLI 应仍可用: {}", r.stderr);
+
+    // 故障恢复：退避节奏下自愈（interval=1 → 退避恒 1s）
+    stub.set_outage(false);
+    assert!(
+        wait_until(Duration::from_secs(10), || {
+            stub.auth_state().unwrap().refresh_count >= 1
+        }),
+        "故障恢复后应自愈完成轮换，stderr：{}",
+        daemon.stderr()
+    );
+    let stderr = daemon.stderr();
+    assert!(stderr.contains("保活失败"), "应有失败日志：{stderr}");
+    assert!(
+        stderr.contains("refresh 轮换成功"),
+        "恢复后应有成功日志：{stderr}"
+    );
+    let cfg = read_config(&home_str);
+    let state = stub.auth_state().unwrap();
+    assert_eq!(
+        cfg.refresh_token.as_deref(),
+        Some(state.refresh_token.as_str())
+    );
+
+    let (status, stderr) = daemon.sigterm_and_wait(Duration::from_secs(5));
+    assert_eq!(status.code(), Some(0), "stderr：{stderr}");
+}
+
+#[test]
+fn daemon_无_foreground_非_systemd_降级前台循环() {
+    if systemd_machine() {
+        // bare daemon 在 systemd 机器上会真实安装并 enable 服务（预期行为），
+        // e2e 不该动真实系统配置；安装路径由 unit 测试（假 systemctl）覆盖。
+        return;
+    }
+    let stub = auth_stub(true);
+    let (_home, home_str, _) = do_login(&stub);
+    // 不带 --foreground：macOS/容器上应明确提示降级并直接前台循环
+    let daemon = DaemonProc::spawn(
+        &["daemon", "--interval", "1"],
+        &[("HOME", home_str.as_str())],
+    );
+    assert!(
+        wait_until(Duration::from_secs(10), || {
+            daemon.stderr().contains("未检测到 systemd")
+                && stub.auth_state().unwrap().refresh_count >= 2
+        }),
+        "应提示降级并前台循环轮换，stderr：{}",
+        daemon.stderr()
+    );
+    let (status, stderr) = daemon.sigterm_and_wait(Duration::from_secs(5));
+    assert_eq!(status.code(), Some(0), "stderr：{stderr}");
+    assert!(
+        stderr.contains("未检测到 systemd"),
+        "应有降级提示：{stderr}"
+    );
+}
+
+#[test]
+fn daemon_无任何凭据_致命退出_一行json错误() {
+    let home = TempDir::new().unwrap();
+    let home_str = home.path().to_str().unwrap().to_owned();
+    // 空 HOME + 仅 env endpoint：无 refreshToken 也无 contact+password
+    let r = run_hostbee(
+        &["daemon", "--interval", "1", "--foreground"],
+        &[
+            ("HOME", home_str.as_str()),
+            ("HOSTBEE_ENDPOINT", "http://127.0.0.1:1"),
+        ],
+    );
+    assert_eq!(r.code, Some(1));
+    assert_eq!(r.stdout, "", "daemon stdout 恒空");
+    let json = r.stderr_json();
+    let message = json["errors"][0]["message"].as_str().unwrap();
+    assert!(message.contains("凭据"), "应提示凭据缺失: {message}");
+}
+
+#[test]
+fn daemon_interval_0_拒绝() {
+    let r = run_hostbee(&["daemon", "--interval", "0"], &[]);
+    assert_eq!(r.code, Some(1));
+    assert_eq!(r.stdout, "");
+    let json = r.stderr_json();
+    let message = json["errors"][0]["message"].as_str().unwrap();
+    assert!(
+        message.contains("interval"),
+        "应提示 interval 非法: {message}"
+    );
+}
+
+#[test]
+fn daemon_interval_不小于_7天_tll_有警告仍继续检查凭据() {
+    let home = TempDir::new().unwrap();
+    let home_str = home.path().to_str().unwrap().to_owned();
+    // interval >= 604800：先警告（带时间戳日志），再做凭据预检（本用例无凭据 → 致命）
+    let r = run_hostbee(
+        &["daemon", "--interval", "604800", "--foreground"],
+        &[
+            ("HOME", home_str.as_str()),
+            ("HOSTBEE_ENDPOINT", "http://127.0.0.1:1"),
+        ],
+    );
+    assert_eq!(r.code, Some(1));
+    let lines: Vec<&str> = r.stderr.lines().collect();
+    assert!(lines.len() >= 2, "应有警告日志 + JSON 错误: {lines:?}");
+    assert!(lines[0].contains("7 天"), "首行应为 TTL 警告: {}", lines[0]);
+    assert!(
+        lines[0].starts_with('['),
+        "日志行应带时间戳前缀: {}",
+        lines[0]
+    );
+    // 最后一行是一行 JSON 错误
+    let json: Value = serde_json::from_str(lines[lines.len() - 1]).expect("末行应为 JSON 错误");
+    let message = json["errors"][0]["message"].as_str().unwrap();
+    assert!(message.contains("凭据"), "应提示凭据缺失: {message}");
+}

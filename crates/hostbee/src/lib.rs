@@ -6,6 +6,8 @@
 
 pub mod auth;
 pub mod config;
+pub mod daemon;
 pub mod endpoint;
 pub mod error;
 pub mod gql;
+pub mod systemd;
