@@ -1,0 +1,8 @@
+[submodule "rustybee"]
+	path = vendor/backend/rustybee
+	url = https://github.com/hostbee/rustybee
+	branch = release/0.12.3
+[submodule "hostbee-webclient"]
+	path = vendor/reference/hostbee-webclient
+	url = https://github.com/hostbee/hostbee-webclient
+	branch = release/0.12.3
