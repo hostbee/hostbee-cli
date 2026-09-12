@@ -45,10 +45,10 @@ hostbee vm vm-instances --fields '{ nodes { id status } totalNum }'
   10MB 响应上限（实测 6611 个订单的 `orders` 超限报错）。此类场景用分页变体
   （`orders-paging` 等）或 `--depth 0`（标量展开，实测 1.8MB 可跑）。
 - **插件 mutation 的 BorshOrJson**：`plugin plugin-mutation-resource-*` 等命令的
-  input 是 oneOf（borsh/json 二选一），CLI 按设计一律走 json 分支——`--input '<json>'`
-  整体 JSON 透传（codegen-design.md §3；sdc 网络数据面与插件内部机制不设专用命令，
+  input 是 oneOf（borsh/json 二选一），CLI 不自动包装——json 分支传 `--input '{"json":{}}'`，
+  整个 oneOf 输入原样 JSON 透传（codegen-design.md §3；sdc 网络数据面与插件内部机制不设专用命令，
   spec #1 Out of Scope）。
-- **产物再生成**：schema 更新后运行 `cargo run -p hostbee-codegen`，产物
+- **产物再生成**：同域合法字段新增后仅需运行 `cargo run -p hostbee-codegen`（不限制历史字段数量；未知域或类型仍 fail-fast），产物
   （`crates/hostbee/src/generated/{mod.rs,docs.rs}`）commit 进仓库，重跑幂等。
   产物头部带 schema sha256 漂移标记，`cargo test` 会校验并提示重跑。
   **前提**：`vendor/backend/rustybee` 子模块须初始化（`git submodule update --init`）。
@@ -212,18 +212,21 @@ CLI 侧 401 → refresh → 密码重登的兜底路径保持不变（daemon 只
 
 ## 输出契约
 
-| 通道 | 成功 | 失败 |
+| 场景 | stdout | stderr / exit |
 | --- | --- | --- |
-| stdout | 仅一行 compact JSON（GraphQL envelope 中 `data` 的值） | 无输出 |
-| stderr | 无输出 | 仅一行 JSON：`{"errors":[...]}` |
-| exit code | `0` | `1` |
+| 普通调用成功 | 一行 compact data JSON | 无错误，exit 0 |
+| 普通调用或参数失败 | 空 | 单行 errors JSON，exit 1 |
+| 显式 --help / --version | 帮助或版本文本 | 空，exit 0 |
+| 无参数调用 | 空 | 含使用帮助的单行 errors JSON，exit 1 |
+| 交互登录 / 落盘警告 | 成功时仍为结果 JSON | 提示、诊断可为纯文本；落盘警告不改变请求成功状态 |
+| daemon | 恒空 | 带时间戳日志；致命错误末行为 JSON，详见 daemon 章节 |
 
 - 服务端返回的 GraphQL `errors` 数组**原样**透传到 stderr（含 `locations`、`extensions`
   等任意字段）。本地后端的校验错误走 HTTP 400 + 带 `errors` 的 envelope，同样按此透传。
 - 传输失败、非 2xx 无 errors envelope、配置/参数错误等本地失败，合成同形状的
   `{"errors":[{"message":"..."}]}`。
-- 失败统一 exit code `1`，失败原因一律从 stderr JSON 读取，不再细分码位。
-- 日志与诊断一律走 stderr，stdout 永远只有结果 JSON，可安全管道给 `jq`。
+- 失败统一 exit code `1`，普通调用失败原因从 stderr JSON 读取，不再细分码位。
+- 普通业务调用的日志与诊断走 stderr，stdout 只有结果 JSON；显式帮助/版本输出文本，daemon 无 stdout。
 
 ## HTTP 客户端选型
 
@@ -265,11 +268,10 @@ e2e 测试完全 hermetic（内存 stub server），hook 不访问 localhost 以
   （脚本化传输）、unit 文件 golden、systemd 检测/PATH 查找、假 systemctl 脚本驱动的
   完整安装流程（幂等重装、失败汇总）。
 - **codegen 产物断言**（`crates/hostbee/tests/codegen_product.rs`）：schema sha256
-  漂移标记（schema 变更后提示重跑生成器）、208 命令全量结构断言（领域分组与
-  schema-survey 目录一致、vm 组 12 命令）、208×9 document 全量 `parse_query`
+  漂移标记（schema 变更后提示重跑生成器）、当前 schema 命令动态完整覆盖断言（领域全部接线、命令无重复）、全部九档 document `parse_query`
   可解析、`--fields` 拼接路径可解析、tracer（vmInstances）默认 document 逐字节
   快照、展开尺寸预算；`commands.rs` unit 侧断言全 18 领域组挂载且与注册表逐组
-  一致（208 命令全部可见）、别名逐条可见、注册表无 flag 冲突/撞名。
+  一致（当前注册表命令全部可见）、别名逐条可见、注册表无 flag 冲突/撞名。
   生成器对 flag 冲突（参数 kebab 化后重复、与运行时 flag 撞名）fail-fast，
   含对应 unit 断言。
 - **e2e**（`crates/hostbee/tests/e2e/`，`cargo test --test e2e`）：全仓库唯一的「高 seam」，

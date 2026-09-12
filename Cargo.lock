@@ -417,6 +417,7 @@ dependencies = [
  "async-graphql-parser",
  "clap",
  "sha2",
+ "tempfile",
 ]
 
 [[package]]

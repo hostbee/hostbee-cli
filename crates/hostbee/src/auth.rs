@@ -277,12 +277,18 @@ pub fn execute<T: GraphqlTransport>(
     if let Some(token) = session.refresh_token.clone() {
         match refresh(transport, &session.endpoint, &token) {
             Ok(pair) => return retry_with_pair(transport, session, pair, &body),
-            Err(e) => notes.push(format!("refresh 轮换未成功（{}）", summarize(&e))),
+            Err(e) => notes.push(format!(
+                "refresh 轮换未成功（{}）",
+                crate::error::summarize(&e)
+            )),
         }
         if let Some(fallback) = session.fallback_refresh_token.clone() {
             match refresh(transport, &session.endpoint, &fallback) {
                 Ok(pair) => return retry_with_pair(transport, session, pair, &body),
-                Err(e) => notes.push(format!("备用 refreshToken 轮换未成功（{}）", summarize(&e))),
+                Err(e) => notes.push(format!(
+                    "备用 refreshToken 轮换未成功（{}）",
+                    crate::error::summarize(&e)
+                )),
             }
         }
     }
@@ -297,7 +303,10 @@ pub fn execute<T: GraphqlTransport>(
             session.totp_secret.as_deref(),
         ) {
             Ok(pair) => return retry_with_pair(transport, session, pair, &body),
-            Err(e) => notes.push(format!("密码重新登录未成功（{}）", summarize(&e))),
+            Err(e) => notes.push(format!(
+                "密码重新登录未成功（{}）",
+                crate::error::summarize(&e)
+            )),
         }
     }
 
@@ -386,20 +395,6 @@ fn merged_recovery_failure(original: CliError, notes: &[String]) -> CliError {
     };
     errors.extend(notes.iter().map(|note| json!({ "message": note })));
     CliError::GraphQlErrors(errors)
-}
-
-/// 错误的简短摘要（附注用）：GraphQL 错误取首条 message，其余取合成 message。
-fn summarize(err: &CliError) -> String {
-    let text = match err {
-        CliError::GraphQlErrors(errors) => errors
-            .first()
-            .and_then(|e| e.get("message"))
-            .and_then(Value::as_str)
-            .unwrap_or("GraphQL errors")
-            .to_owned(),
-        other => other.message(),
-    };
-    crate::error::truncate(&text, 200)
 }
 
 #[cfg(test)]

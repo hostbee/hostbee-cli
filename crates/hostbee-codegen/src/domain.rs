@@ -27,7 +27,7 @@ pub const DOMAIN_ORDER: &[&str] = &[
 ];
 
 /// 模糊归属与例外：显式逐条指定（survey §1.2「模糊归属清单」+ auth 收编 + wallet 域）。
-/// 排序无关；unit 测试断言全量分组与 survey §2 的每组计数一致。
+/// 排序无关；产物测试断言全部分组均接线，不锁定历史规模。
 const OVERRIDES: &[(&str, &str)] = &[
     // ---- auth 收编：token/凭证语义字段，即使带 user 前缀也归 auth ----
     ("userAuth", "auth"),

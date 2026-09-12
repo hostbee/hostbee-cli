@@ -3,12 +3,12 @@
 //! 断言对象是「生成器产物 ↔ 当前 vendored schema」的一致性：
 //! - schema sha256 漂移标记（schema 变了请重跑生成器）；
 //! - 结构断言：全部 root field（除 login/refresh）都有命令、领域分组与
-//!   schema-survey.md §2 目录一致、vm 组 12 命令齐全；
-//! - document 合法性：208×9 全量 `parse_query` 可解析、`--fields` 拼接路径同样可解析；
+//!   全部领域接线且命令唯一（不固定历史规模）；
+//! - document 合法性：全部九档 `parse_query` 可解析、`--fields` 拼接路径同样可解析；
 //! - 快照断言：tracer（vmInstances）的默认 document 逐字节锁定；
 //! - 尺寸预算：默认档文档总量不超基线（防展开失控）。
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::path::Path;
 
 use hostbee::generated::docs;
@@ -78,7 +78,7 @@ fn schema_sha256_漂移标记一致() {
 #[test]
 fn 全部_root_field_都有命令_除_login_refresh() {
     let names = root_field_names(&schema_sdl());
-    assert_eq!(names.len(), 210, "schema root field 总数应为 210");
+
     let covered: BTreeSet<&str> = FIELDS.iter().map(|f| f.field).collect();
     assert_eq!(covered.len(), FIELDS.len(), "注册表内 field 名不应重复");
     let expected: BTreeSet<&str> = names
@@ -90,69 +90,12 @@ fn 全部_root_field_都有命令_除_login_refresh() {
 }
 
 #[test]
-fn 领域分组_与勘察目录一致() {
-    let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
-    for f in FIELDS {
-        *counts.entry(f.domain).or_default() += 1;
-    }
-    // schema-survey.md §2：auth 31 中 login/refresh 由 auth.rs 手写 → 剩 29。
-    let expected = [
-        ("auth", 29),
-        ("user", 14),
-        ("wallet", 8),
-        ("vm", 12),
-        ("infra", 27),
-        ("store", 25),
-        ("order", 9),
-        ("subscription", 13),
-        ("payment", 7),
-        ("kyc", 11),
-        ("ticket", 7),
-        ("notice", 4),
-        ("plugin", 5),
-        ("task", 5),
-        ("sms", 12),
-        ("settings", 13),
-        ("accesslog", 3),
-        ("admin", 4),
-    ];
-    for (domain, count) in expected {
-        assert_eq!(
-            counts.get(domain),
-            Some(&count),
-            "领域 {domain} 计数不符（schema 变更后重跑生成器并核对 survey）"
-        );
-    }
-    assert_eq!(FIELDS.len(), 208);
-}
-
-#[test]
-fn vm_组_12_命令_齐全_且注册表含全_18_域() {
-    let vm: Vec<&str> = FIELDS
-        .iter()
-        .filter(|f| f.domain == "vm")
-        .map(|f| f.command)
-        .collect();
-    assert_eq!(
-        vm,
-        [
-            "vm-instances",
-            "vm-instance-by-subscription",
-            "vm-by-subscription",
-            "vnc-prepare",
-            "serial-prepare",
-            "vm-instance-search",
-            "vm-instances-connection",
-            "update-vm-instance",
-            "vm-switch-egress",
-            "vm-init",
-            "vm-init2",
-            "vm-power-action",
-        ]
-    );
-    // ticket #5 翻牌前提：其余 17 域的数据已全量在注册表。
-    let domains: BTreeSet<&str> = FIELDS.iter().map(|f| f.domain).collect();
-    assert_eq!(domains.len(), 18, "注册表应覆盖全部 18 个领域组");
+fn 领域分组均接线且无重复命令() {
+    let domains: BTreeSet<_> = FIELDS.iter().map(|f| f.domain).collect();
+    let enabled: BTreeSet<_> = hostbee::commands::ENABLED_DOMAINS.iter().copied().collect();
+    assert_eq!(domains, enabled);
+    let commands: BTreeSet<_> = FIELDS.iter().map(|f| (f.domain, f.command)).collect();
+    assert_eq!(commands.len(), FIELDS.len());
 }
 
 #[test]
@@ -217,7 +160,7 @@ fn 全部_document_九档均可被_parse_query_解析() {
             parsed += 1;
         }
     }
-    assert_eq!(parsed, 208 * 9);
+    assert_eq!(parsed, FIELDS.len() * 9);
 }
 
 #[test]
@@ -288,6 +231,9 @@ fn 展开尺寸_不超基线() {
         .map(|f| f.documents[hostbee::commands::DEFAULT_DEPTH].len())
         .max()
         .unwrap();
-    assert!(total < 200_000, "默认档文档总量 {total} B 超基线");
+    assert!(
+        total < FIELDS.len() * 1_000,
+        "默认档文档总量 {total} B 超基线"
+    );
     assert!(max < 8_000, "最大文档 {max} B 超基线");
 }
