@@ -4,6 +4,12 @@
 
 - 所有文档和 Markdown 文件必须主要使用中文编写，中文习惯上不翻译的术语才保留。
 
+## Quality gates
+
+- 仓库使用 git hooks（pre-push）强制执行 unit test + e2e test + format check + lint，任一失败即中止。
+- Agent 禁止以任何方式跳过 hooks 完成 commit/push，包括但不限于 `--no-verify`、`HUSKY=0`、卸载或禁用 hook。
+- hook 失败时：修复问题后重新 push，不允许绕过。
+
 ## Commit conventions
 
 - 格式：`<type>[optional scope]: <description>`
