@@ -837,6 +837,45 @@ fn daemon_无_foreground_非_systemd_降级前台循环() {
 }
 
 #[test]
+fn daemon_旧refresh已撤销_密码重登自愈() {
+    let stub = auth_stub(true);
+    let (_home, home_str, _) = do_login(&stub);
+    // 模拟长期离线后 refreshToken 被服务端 revoke（例如别处 CLI 已轮换过）
+    overwrite_config(&home_str, |cfg| {
+        cfg.refresh_token = Some("revoked-refresh".to_owned());
+    });
+    let daemon = DaemonProc::spawn(
+        &["daemon", "--interval", "1", "--foreground"],
+        &[("HOME", home_str.as_str())],
+    );
+    assert!(
+        wait_until(Duration::from_secs(10), || {
+            stub.auth_state().unwrap().login_count >= 2
+        }),
+        "daemon 应在 refresh 失败后密码重登自愈，stderr：{}",
+        daemon.stderr()
+    );
+    let (status, stderr) = daemon.sigterm_and_wait(Duration::from_secs(5));
+    assert_eq!(status.code(), Some(0), "stderr：{stderr}");
+    assert!(
+        stderr.contains("密码重登恢复会话成功"),
+        "应有重登成功日志：{stderr}"
+    );
+    // 恰一次重登（setup login + daemon 自愈一次），TOTP 交换随之完成；
+    // 自愈成功后后续周期走正常 refresh，不再触发重登
+    let state = stub.auth_state().unwrap();
+    assert_eq!(state.login_count, 2);
+    assert_eq!(state.totp_count, 2);
+    assert!(attempt_count(&stub, "refresh(refreshToken") >= 1);
+    // 配置已轮换为重登拿到的新对（与 stub 当前有效 refreshToken 一致）
+    let cfg = read_config(&home_str);
+    assert_eq!(
+        cfg.refresh_token.as_deref(),
+        Some(state.refresh_token.as_str())
+    );
+}
+
+#[test]
 fn daemon_无任何凭据_致命退出_一行json错误() {
     let home = TempDir::new().unwrap();
     let home_str = home.path().to_str().unwrap().to_owned();
