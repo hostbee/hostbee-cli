@@ -289,4 +289,36 @@ mod tests {
         );
         assert!(err.err().expect("应 fail-fast").contains("Ghost"));
     }
+
+    #[test]
+    fn 参数与运行时_flag_撞名_fail_fast() {
+        // 参数名 kebab 化后为 depth/fields/endpoint → 与 CLI 运行时 flag 撞名，生成期报错
+        let err = schema::load(
+            r#"
+            schema { query: Q mutation: M }
+            type Q { vmF(endpoint: String!): Int! }
+            type M { vmM: Int! }
+            "#,
+        )
+        .and_then(|m| emit::build_commands(&m));
+        let err = err.err().expect("应 fail-fast");
+        assert!(err.contains("撞名"), "错误应说明撞名: {err}");
+        assert!(err.contains("endpoint"), "错误应包含 flag 名: {err}");
+    }
+
+    #[test]
+    fn 参数_kebab_化后重复_fail_fast() {
+        // `filter` 与 `Filter` kebab 化后同为 `filter` → 同命令内 flag 冲突
+        let err = schema::load(
+            r#"
+            schema { query: Q mutation: M }
+            input In { a: Int }
+            type Q { vmF(filter: In!, Filter: In!): Int! }
+            type M { vmM: Int! }
+            "#,
+        )
+        .and_then(|m| emit::build_commands(&m));
+        let err = err.err().expect("应 fail-fast");
+        assert!(err.contains("冲突"), "错误应说明 flag 冲突: {err}");
+    }
 }

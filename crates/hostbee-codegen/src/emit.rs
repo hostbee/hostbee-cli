@@ -220,6 +220,27 @@ pub fn build_commands(schema: &SchemaModel) -> Result<Vec<CommandModel>, String>
             return Err(format!("产物常量名冲突：{}", c.const_name));
         }
     }
+    // flag 冲突 fail-fast：同命令内 flag 互不重复，且不与运行时 flag
+    // （--depth/--fields/--endpoint，hostbee 侧 field_command 挂载）撞名。
+    // schema 演进引入撞名时在生成期报错，优于 clap 运行期的怪异行为。
+    const RUNTIME_FLAGS: &[&str] = &["depth", "fields", "endpoint"];
+    for c in &commands {
+        let mut flags = BTreeSet::new();
+        for a in &c.args {
+            if !flags.insert(a.flag.as_str()) {
+                return Err(format!(
+                    "root field {} 的参数 kebab 化后 flag 冲突：--{} 重复",
+                    c.field, a.flag
+                ));
+            }
+            if RUNTIME_FLAGS.contains(&a.flag.as_str()) {
+                return Err(format!(
+                    "root field {} 的参数 {} kebab 化为 --{}，与 CLI 运行时 flag 撞名",
+                    c.field, a.arg, a.flag
+                ));
+            }
+        }
+    }
     Ok(commands)
 }
 

@@ -7,8 +7,8 @@
 //! - 本模块：消费注册表的全部运行时逻辑。
 //!
 //! 命令面两层结构：领域组 → field 子命令（kebab-case，Query/Mutation 混排）。
-//! [`ENABLED_DOMAINS`] 控制哪些组挂进 CLI——ticket #5 逐组开启剩余领域时，
-//! 在该列表加一行域名即可（领域数据已全量在注册表中）。
+//! [`ENABLED_DOMAINS`] 为全 18 组（ticket #5 铺开完成后与注册表领域集一致，
+//! 留作接线开关：registry 常驻全量，CLI 按需挂载）。
 
 use clap::{Arg, ArgMatches, Command};
 use serde_json::{Value, json};
@@ -27,9 +27,29 @@ pub const DEFAULT_DEPTH: usize = 3;
 
 /// 已接线领域组：按领域名在 [`crate::generated::FIELDS`] 中筛选挂进 CLI。
 ///
-/// ticket #4 以 vm 为 tracer 打通链路；ticket #5 逐组开启其余 17 个领域——
-/// 在此列表增补域名（如 `"order"`）即完成接线，无需其他改动。
-pub const ENABLED_DOMAINS: &[&str] = &["vm"];
+/// ticket #5 起全 18 组开启（顺序与 codegen 的 `DOMAIN_ORDER`/survey §2 一致，
+/// 即 `--help` 的组序）。schema 新增领域时生成器会 fail-fast 要求补分组规则，
+/// 此处同步增补一行域名即完成接线。
+pub const ENABLED_DOMAINS: &[&str] = &[
+    "auth",
+    "user",
+    "wallet",
+    "vm",
+    "infra",
+    "store",
+    "order",
+    "subscription",
+    "payment",
+    "kyc",
+    "ticket",
+    "notice",
+    "plugin",
+    "task",
+    "sms",
+    "settings",
+    "accesslog",
+    "admin",
+];
 
 /// 手写别名（不进 codegen 规则，见 codegen-design.md §2.4；逐条注释指向生成名，
 /// 避免 codegen 腐烂）。clap 侧 `visible_alias`：`vm list` → `vm vm-instances`。
@@ -37,6 +57,10 @@ const ALIASES: &[(&str, &str, &str)] = &[
     // (领域, 别名, 生成的命令名)
     ("vm", "list", "vm-instances"), // vmInstances：分页实例列表
     ("vm", "search", "vm-instance-search"), // vmInstanceSearch：实例搜索
+    // orders-paging：分页订单列表。codegen-design.md §2.4 原指全量查询 orders，
+    // 但 live 后端 6611 单在 depth 3 下全量返回超传输上限（10MB，实测报错）；
+    // 别名改指分页变体，与「默认单页」哲学一致（全量场景用 orders --depth 0）。
+    ("order", "list", "orders-paging"),
 ];
 
 /// 参数 → flag 的种类。
@@ -730,23 +754,75 @@ mod tests {
     }
 
     #[test]
-    fn build_cli_只挂已接线领域() {
+    fn build_cli_挂载全_18_领域_全量命令面() {
         let cmd = build_cli();
-        let matches = cmd
-            .try_get_matches_from(["hostbee", "vm", "vm-instances"])
-            .unwrap();
-        assert_eq!(matches.subcommand().unwrap().0, "vm");
-        // 未接线领域（如 order）被 clap 拒绝
-        let cmd = build_cli();
+        // 根命令：3 个手写（login/gql/daemon）+ 18 个领域组
+        let subcommands: Vec<&str> = cmd.get_subcommands().map(|s| s.get_name()).collect();
+        let mut expected: Vec<&str> = ["login", "gql", "daemon"].to_vec();
+        expected.extend(ENABLED_DOMAINS);
+        assert_eq!(subcommands, expected, "根命令面应为手写命令 + 全部领域组");
+        // 每个领域组挂载注册表中该域的全部命令（208 个生成命令逐组可命中）
+        let mut total = 0;
+        for domain in ENABLED_DOMAINS {
+            let group = cmd
+                .find_subcommand(domain)
+                .unwrap_or_else(|| panic!("领域组 {domain} 应已挂载"));
+            let wired: std::collections::BTreeSet<&str> =
+                group.get_subcommands().map(|s| s.get_name()).collect();
+            let registered: std::collections::BTreeSet<&str> = FIELDS
+                .iter()
+                .filter(|f| f.domain == *domain)
+                .map(|f| f.command)
+                .collect();
+            assert_eq!(wired, registered, "领域 {domain} 的挂载命令应与注册表一致");
+            total += registered.len();
+        }
+        assert_eq!(total, FIELDS.len());
+        assert_eq!(total, 208, "全 schema 铺开：208 个生成命令全部可见");
+        // 手写别名逐条可见且指向注册表中的生成命令
+        for (domain, alias, target) in ALIASES {
+            let group = cmd.find_subcommand(domain).expect("别名所在领域应挂载");
+            let leaf = group
+                .find_subcommand(target)
+                .unwrap_or_else(|| panic!("别名目标 {domain}/{target} 应在注册表"));
+            assert!(
+                leaf.get_visible_aliases().any(|a| a == *alias),
+                "{domain} 组的 {alias} 别名应可见"
+            );
+        }
+        // 手写命令仍在；auth 组不含 login/refresh（ticket #3/#4 手写让位）
         assert!(
-            cmd.try_get_matches_from(["hostbee", "order", "orders"])
-                .is_err()
-        );
-        // 手写命令仍在
-        let cmd = build_cli();
-        assert!(
-            cmd.try_get_matches_from(["hostbee", "gql", "{ x }"])
+            build_cli()
+                .try_get_matches_from(["hostbee", "gql", "{ x }"])
                 .is_ok()
         );
+        assert!(
+            build_cli()
+                .try_get_matches_from(["hostbee", "auth", "login"])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn 命令注册表_无flag冲突与运行时flag撞名() {
+        // 每个命令的 flags 互不重复，且不与运行时 flag（--depth/--fields/--endpoint）撞名；
+        // schema 演进引入撞名时在产物断言层拦住（生成器 fail-fast 优于 clap 运行期怪象）。
+        for spec in FIELDS {
+            let mut seen = std::collections::BTreeSet::new();
+            for arg in spec.args {
+                assert!(
+                    seen.insert(arg.flag),
+                    "{} 的 flag --{} 重复",
+                    spec.command,
+                    arg.flag
+                );
+                assert!(
+                    !matches!(arg.flag, "depth" | "fields" | "endpoint"),
+                    "{} 的参数 flag --{} 与运行时 flag 撞名",
+                    spec.command,
+                    arg.flag
+                );
+            }
+        }
     }
 }

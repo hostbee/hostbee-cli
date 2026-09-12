@@ -21,9 +21,11 @@ cargo build                    # 开发构建：target/debug/hostbee
 JSON 同构。设计决策见 [docs/adr/0002-命令面全量-codegen.md](docs/adr/0002-命令面全量-codegen.md)。
 
 ```sh
-hostbee vm --help                       # 领域组内前缀发现全部命令
-hostbee vm vm-instances --page-size 1  # 分页查询：默认 25/1/filter {}
-hostbee vm list                         # 手写别名 → vm vm-instances
+hostbee --help                            # 全量命令面：18 领域组 + login/gql/daemon
+hostbee vm --help                         # 领域组内前缀发现全部命令
+hostbee vm vm-instances --page-size 1   # 分页查询：默认 25/1/filter {}
+hostbee order orders-paging --page-num 2  # 任意领域同理（order/subscription/store/…）
+hostbee vm list                           # 手写别名 → vm vm-instances
 hostbee vm update-vm-instance --input '{"id":608,"rootPassword":"x"}'
                                         # 输入对象整体 JSON 透传
 hostbee vm vm-instances --depth 8      # selection set 展开深度 0..=8，默认 3
@@ -31,18 +33,28 @@ hostbee vm vm-instances --fields '{ nodes { id status } totalNum }'
                                         # 完全覆盖生成的 selection set
 ```
 
-- **接线范围**：生成器产物覆盖全部 210 个 root field（`login`/`refresh` 由 auth.rs
-  手写实现除外）；当前 CLI 只接线 `vm` 领域（ticket #4 tracer），其余 17 个领域组
-  在 `crates/hostbee/src/commands.rs` 的 `ENABLED_DOMAINS` 中逐组开启（ticket #5，
-  每个领域一行）。
+- **接线范围**：全 18 个领域组全部接线（ticket #5），`hostbee --help` 即全量发现面
+  （spec 用户故事 11/12）。生成器产物覆盖全部 210 个 root field，`login`/`refresh`
+  两个 field 由 auth.rs 手写实现（codegen 让位，`hostbee login` 直属根命令）；
+  admin/mgmt 操作与用户操作同一扁平命令面（ADR-0001，不设权限分层）。
 - **分页**：默认单页。`pageSize/pageNum` 风格 CLI 默认 `--page-size 25`/`--page-num 1`；
   游标风格 CLI 默认 `--first 25`（`--after`/`--before`/`--last` 可选）。输出保留
   schema 中的分页元数据（`totalNum` / `pageInfo` / `totalCount`）。
+- **全量列表命令的体积注意**：schema 中无服务端分页的全量列表 field（`orders`、
+  `subscriptions` 等）在数据量大的后端上按默认 depth 3 展开可能超过 HTTP 传输的
+  10MB 响应上限（实测 6611 个订单的 `orders` 超限报错）。此类场景用分页变体
+  （`orders-paging` 等）或 `--depth 0`（标量展开，实测 1.8MB 可跑）。
+- **插件 mutation 的 BorshOrJson**：`plugin plugin-mutation-resource-*` 等命令的
+  input 是 oneOf（borsh/json 二选一），CLI 按设计一律走 json 分支——`--input '<json>'`
+  整体 JSON 透传（codegen-design.md §3；sdc 网络数据面与插件内部机制不设专用命令，
+  spec #1 Out of Scope）。
 - **产物再生成**：schema 更新后运行 `cargo run -p hostbee-codegen`，产物
   （`crates/hostbee/src/generated/{mod.rs,docs.rs}`）commit 进仓库，重跑幂等。
   产物头部带 schema sha256 漂移标记，`cargo test` 会校验并提示重跑。
   **前提**：`vendor/backend/rustybee` 子模块须初始化（`git submodule update --init`）。
-- 手写别名表（`vm list`、`vm search`）在 `commands.rs` 的 `ALIASES`，不进 codegen 规则。
+- 手写别名表（`vm list`、`vm search`、`order list`→orders-paging）在 `commands.rs`
+  的 `ALIASES`，不进 codegen 规则；schema 演进引入 flag 撞名（参数 kebab 化后重复、
+  或与运行时 `--depth`/`--fields`/`--endpoint` 撞名）时生成器 fail-fast。
 
 ## gql 逃生门
 
@@ -256,7 +268,10 @@ e2e 测试完全 hermetic（内存 stub server），hook 不访问 localhost 以
   漂移标记（schema 变更后提示重跑生成器）、208 命令全量结构断言（领域分组与
   schema-survey 目录一致、vm 组 12 命令）、208×9 document 全量 `parse_query`
   可解析、`--fields` 拼接路径可解析、tracer（vmInstances）默认 document 逐字节
-  快照、展开尺寸预算。
+  快照、展开尺寸预算；`commands.rs` unit 侧断言全 18 领域组挂载且与注册表逐组
+  一致（208 命令全部可见）、别名逐条可见、注册表无 flag 冲突/撞名。
+  生成器对 flag 冲突（参数 kebab 化后重复、与运行时 flag 撞名）fail-fast，
+  含对应 unit 断言。
 - **e2e**（`crates/hostbee/tests/e2e/`，`cargo test --test e2e`）：全仓库唯一的「高 seam」，
   进程边界测试。测试内起内存 stub GraphQL HTTP server（tiny_http，dev-dep），spawn
   编译好的真实二进制（`env!("CARGO_BIN_EXE_hostbee")`）指向它，断言 stdout JSON、
