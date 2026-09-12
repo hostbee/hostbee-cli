@@ -47,7 +47,32 @@ pub trait GraphqlTransport {
 }
 
 /// ureq 实现（同步、阻塞式；选型见 README）。
-pub struct UreqTransport;
+///
+/// `timeout` 为单次调用的整体超时：CLI 单次命令不设（进程短生命周期，由用户中断）；
+/// daemon 等常驻进程用 [`UreqTransport::with_timeout`] 限定，避免后端挂起卡死循环。
+pub struct UreqTransport {
+    pub timeout: Option<std::time::Duration>,
+}
+
+impl UreqTransport {
+    /// CLI 默认：不设超时。
+    pub const fn new() -> Self {
+        Self { timeout: None }
+    }
+
+    /// 常驻进程用：单次调用整体超时（覆盖连接、响应与 body 读取全程）。
+    pub const fn with_timeout(timeout: std::time::Duration) -> Self {
+        Self {
+            timeout: Some(timeout),
+        }
+    }
+}
+
+impl Default for UreqTransport {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl GraphqlTransport for UreqTransport {
     fn post(
@@ -61,6 +86,7 @@ impl GraphqlTransport for UreqTransport {
         // 这样非 2xx 时仍能读取 body 组装 errors。
         let agent: ureq::Agent = ureq::Agent::config_builder()
             .http_status_as_error(false)
+            .timeout_global(self.timeout)
             .build()
             .into();
         let mut request = agent.post(&url);

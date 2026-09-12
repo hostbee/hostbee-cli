@@ -52,28 +52,50 @@ enum Command {
         #[arg(long)]
         endpoint: Option<String>,
     },
+    /// refreshToken 保活 daemon：定期 refresh 轮换并原子落盘（systemd 机器自动安装
+    /// user unit 并 enable，非 systemd 环境降级前台运行）
+    Daemon {
+        /// 轮换周期（秒），默认 86400（每天一次，远小于 refreshToken 的 7 天固定 TTL）
+        #[arg(long, default_value_t = hostbee::daemon::DEFAULT_INTERVAL_SECS)]
+        interval: u64,
+        /// 跳过 systemd 安装，直接前台运行保活循环（unit 的 ExecStart 即此形态）
+        #[arg(long)]
+        foreground: bool,
+        /// 覆盖 endpoint（优先级：flag > HOSTBEE_ENDPOINT > ~/.hostbee/config.toml）；
+        /// 仅 --foreground 可用——systemd 服务进程读不到安装现场的 flag/env
+        #[arg(long)]
+        endpoint: Option<String>,
+    },
 }
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
-    match run(cli) {
-        Ok(data) => {
-            // compact 单行 JSON：效率优先，stdout 不掺杂任何其他输出。
-            println!(
-                "{}",
-                serde_json::to_string(&data).expect("Value 序列化不会失败")
-            );
-            ExitCode::SUCCESS
-        }
-        Err(err) => {
-            eprintln!("{}", err.stderr_json());
-            ExitCode::from(FAILURE_EXIT_CODE)
-        }
+    match cli.command {
+        // daemon 无 stdout JSON 契约（stdout 恒空、日志全在 stderr），单独编排
+        Command::Daemon {
+            interval,
+            foreground,
+            endpoint,
+        } => hostbee::daemon::main_entry(interval, foreground, endpoint.as_deref()),
+        command => match run(command) {
+            Ok(data) => {
+                // compact 单行 JSON：效率优先，stdout 不掺杂任何其他输出。
+                println!(
+                    "{}",
+                    serde_json::to_string(&data).expect("Value 序列化不会失败")
+                );
+                ExitCode::SUCCESS
+            }
+            Err(err) => {
+                eprintln!("{}", err.stderr_json());
+                ExitCode::from(FAILURE_EXIT_CODE)
+            }
+        },
     }
 }
 
-fn run(cli: Cli) -> Result<Value, CliError> {
-    match cli.command {
+fn run(command: Command) -> Result<Value, CliError> {
+    match command {
         Command::Login {
             contact,
             password,
@@ -85,6 +107,8 @@ fn run(cli: Cli) -> Result<Value, CliError> {
             variables,
             endpoint,
         } => gql_cmd(document, variables, endpoint.as_deref()),
+        // daemon 在 main() 已分流（无 stdout JSON 契约），不会进 run
+        Command::Daemon { .. } => unreachable!("daemon 已在 main 分流"),
     }
 }
 
@@ -116,7 +140,12 @@ fn gql_cmd(
 ) -> Result<Value, CliError> {
     let variables = variables.as_deref().map(gql::parse_variables).transpose()?;
     let mut session = load_session(endpoint_flag)?;
-    auth::execute(&gql::UreqTransport, &mut session, &document, variables)
+    auth::execute(
+        &gql::UreqTransport::new(),
+        &mut session,
+        &document,
+        variables,
+    )
 }
 
 /// `hostbee login`：密码登录（TOTP 账号自动完成 verifyTotp 交换），
@@ -141,7 +170,7 @@ fn login_cmd(
         from_flag_or_env(totp_secret, TOTP_SECRET_ENV).or(session.totp_secret.clone());
 
     let pair = auth::login_full(
-        &gql::UreqTransport,
+        &gql::UreqTransport::new(),
         &session.endpoint,
         &contact,
         &password,
