@@ -90,7 +90,12 @@ pub fn write_unit_atomic(path: &Path, content: &str) -> Result<(), String> {
     std::fs::create_dir_all(parent)
         .map_err(|e| format!("创建 unit 目录 {} 失败: {e}", parent.display()))?;
     let tmp = parent.join(format!(".{UNIT_NAME}.tmp"));
-    std::fs::write(&tmp, content).map_err(|e| format!("写入 {} 失败: {e}", tmp.display()))?;
+    use std::io::Write;
+    let mut file =
+        std::fs::File::create(&tmp).map_err(|e| format!("创建 {} 失败: {e}", tmp.display()))?;
+    file.write_all(content.as_bytes())
+        .and_then(|()| file.sync_all())
+        .map_err(|e| format!("写入并同步 {} 失败: {e}", tmp.display()))?;
     std::fs::rename(&tmp, path)
         .map_err(|e| format!("rename {} -> {} 失败: {e}", tmp.display(), path.display()))
 }
@@ -398,5 +403,18 @@ mod tests {
         let failing = fake_bin(dir.path(), "loginctl-bad", "#!/bin/sh\nexit 1\n");
         assert!(enable_linger(Some(&failing)).is_some());
         assert!(enable_linger(None).is_some());
+    }
+}
+
+#[cfg(test)]
+mod atomic_write_tests {
+    #[test]
+    fn unit_覆盖完整且无临时文件() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(super::UNIT_NAME);
+        super::write_unit_atomic(&path, "old long content").unwrap();
+        super::write_unit_atomic(&path, "new").unwrap();
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "new");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
     }
 }

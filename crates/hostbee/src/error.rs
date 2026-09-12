@@ -72,6 +72,20 @@ pub fn truncate(s: &str, max_chars: usize) -> String {
     }
 }
 
+/// 错误简短摘要（日志用）：GraphQL 错误取首条 message，其余取合成 message。
+pub(crate) fn summarize(err: &CliError) -> String {
+    let text = match err {
+        CliError::GraphQlErrors(errors) => errors
+            .first()
+            .and_then(|e| e.get("message"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("GraphQL errors")
+            .to_owned(),
+        other => other.message(),
+    };
+    crate::error::truncate(&text, 200)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

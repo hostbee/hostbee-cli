@@ -14,7 +14,25 @@ use std::process::ExitCode;
 use hostbee::commands;
 
 fn main() -> ExitCode {
-    let matches = commands::build_cli().get_matches();
+    let matches = match commands::build_cli().try_get_matches() {
+        Ok(matches) => matches,
+        Err(err)
+            if matches!(
+                err.kind(),
+                clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion
+            ) =>
+        {
+            print!("{err}");
+            return ExitCode::SUCCESS;
+        }
+        Err(err) => {
+            eprintln!(
+                "{}",
+                hostbee::error::CliError::Input(err.to_string()).stderr_json()
+            );
+            return ExitCode::from(hostbee::error::FAILURE_EXIT_CODE);
+        }
+    };
     let result = match matches.subcommand() {
         // daemon 无 stdout JSON 契约（stdout 恒空、日志全在 stderr），单独编排
         Some(("daemon", sub)) => {
@@ -30,7 +48,7 @@ fn main() -> ExitCode {
         Some(("gql", sub)) => commands::gql_cmd(sub),
         Some((domain, sub)) => commands::dispatch_generated(domain, sub),
         _ => {
-            // arg_required_else_help(true)：无参数时 clap 已打印 help（exit 2）
+            // arg_required_else_help(true)：无参数视为输入错误（exit 1，stderr JSON 内含 help）
             unreachable!("无子命令时 clap 直接退出，不会进入 main 分发")
         }
     };

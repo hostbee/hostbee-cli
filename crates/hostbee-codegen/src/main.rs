@@ -53,60 +53,20 @@ fn run(schema_path: &Path, out_dir: &Path) -> Result<(), String> {
     let model = schema::load(&sdl)?;
     let commands = emit::build_commands(&model)?;
 
-    // 领域分组健全性：全部 root field（含跳过的 login/refresh）都要有归属，
-    // 每组计数与 schema-survey.md §2 的勘察目录一致（lock 住分组规则）。
-    let expected_counts: &[(&str, usize)] = &[
-        ("auth", 31),
-        ("user", 14),
-        ("wallet", 8),
-        ("vm", 12),
-        ("infra", 27),
-        ("store", 25),
-        ("order", 9),
-        ("subscription", 13),
-        ("payment", 7),
-        ("kyc", 11),
-        ("ticket", 7),
-        ("notice", 4),
-        ("plugin", 5),
-        ("task", 5),
-        ("sms", 12),
-        ("settings", 13),
-        ("accesslog", 3),
-        ("admin", 4),
-    ];
-    let total: usize = expected_counts.iter().map(|(_, n)| n).sum();
-    if model.root_fields.len() != total {
-        return Err(format!(
-            "root field 总数 {} 与勘察基线 {total} 不符：schema 更新后请同步\
-             spec-notes/schema-survey.md 与本断言",
-            model.root_fields.len()
-        ));
-    }
+    // 覆盖依据当前 schema 动态计算，不把历史勘察规模当作生成限制。
+    let total = model.root_fields.len();
     for rf in &model.root_fields {
         domain::assign(&rf.name)?;
     }
-    for (domain, expected) in expected_counts {
-        let actual = model
-            .root_fields
-            .iter()
-            .filter(|rf| domain::assign(&rf.name).is_ok_and(|d| d == *domain))
-            .count();
-        if actual != *expected {
-            return Err(format!(
-                "领域 {domain} 命中 {actual} 个 root field，与勘察基线 {} 不符：\
-                 schema 更新后请检查 domain.rs 分组规则",
-                expected
-            ));
-        }
-    }
-    if commands.len() != total - emit::SKIP_FIELDS.len() {
-        return Err(format!(
-            "命令模型 {} 个 ≠ 基线 {} - 手写例外 {}",
-            commands.len(),
-            total,
-            emit::SKIP_FIELDS.len()
-        ));
+    let expected: std::collections::BTreeSet<_> = model
+        .root_fields
+        .iter()
+        .filter(|rf| !emit::SKIP_FIELDS.contains(&rf.name.as_str()))
+        .map(|rf| rf.name.as_str())
+        .collect();
+    let actual: std::collections::BTreeSet<_> = commands.iter().map(|c| c.field.as_str()).collect();
+    if actual != expected || actual.len() != commands.len() {
+        return Err("生成命令未唯一完整覆盖当前 schema".to_owned());
     }
 
     // 产物 document 必须全部可被 query parser 解析（生成侧自查）。
@@ -320,5 +280,30 @@ mod tests {
         .and_then(|m| emit::build_commands(&m));
         let err = err.err().expect("应 fail-fast");
         assert!(err.contains("冲突"), "错误应说明 flag 冲突: {err}");
+    }
+}
+
+#[cfg(test)]
+mod evolution_tests {
+    #[test]
+    fn 新增合法同域字段只需重跑且产物幂等() {
+        let dir = tempfile::tempdir().unwrap();
+        let schema = dir.path().join("schema.graphql");
+        let out = dir.path().join("generated");
+        for fields in ["vmOne: Int!", "vmOne: Int! vmTwo: String!"] {
+            std::fs::write(
+                &schema,
+                format!("schema {{ query: Q mutation: M }} type Q {{ {fields} }} type M {{ vmAct: Int! }}"),
+            )
+            .unwrap();
+            super::run(&schema, &out).unwrap();
+        }
+        let registry = std::fs::read_to_string(out.join("mod.rs")).unwrap();
+        assert!(registry.contains("field: \"vmTwo\""));
+        super::run(&schema, &out).unwrap();
+        assert_eq!(
+            registry,
+            std::fs::read_to_string(out.join("mod.rs")).unwrap()
+        );
     }
 }

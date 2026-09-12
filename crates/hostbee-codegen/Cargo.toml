@@ -11,3 +11,5 @@ async-graphql-parser = "7.2.1"
 clap = { version = "4", default-features = false, features = ["std", "help", "usage", "error-context"] }
 # schema sha256 漂移标记（产物头部注释 + mod.rs 常量，hostbee 侧 unit 测试校验）
 sha2 = "0.10"
+[dev-dependencies]
+tempfile = "3"

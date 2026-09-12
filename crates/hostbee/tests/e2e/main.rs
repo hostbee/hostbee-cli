@@ -1112,3 +1112,26 @@ fn vm_组_help_输出全命令面() {
     assert!(r.stdout.contains("--fields"));
     assert!(r.stdout.contains("--endpoint"));
 }
+
+#[test]
+fn 参数错误统一_json_而帮助版本成功() {
+    for args in [
+        vec![],
+        vec!["unknown"],
+        vec!["vm", "--unknown"],
+        vec!["vm", "vm-init"],
+        vec!["vm", "vm-instances", "--depth", "9"],
+        vec!["vm", "vm-instances", "--page-size", "bad"],
+    ] {
+        let r = run_hostbee(&args, &[]);
+        assert_eq!(r.code, Some(1), "{args:?}: {}", r.stderr);
+        assert!(r.stdout.is_empty());
+        assert!(r.stderr_json()["errors"].is_array());
+    }
+    for args in [vec!["--help"], vec!["--version"], vec!["vm", "--help"]] {
+        let r = run_hostbee(&args, &[]);
+        assert_eq!(r.code, Some(0));
+        assert!(r.stderr.is_empty());
+        assert!(!r.stdout.is_empty());
+    }
+}
