@@ -86,6 +86,89 @@ refreshToken 失效时自动回退到配置文件中的值兜底。
 > 确认；本地 dev 后端可经 `siteGlobalSettingsAlter` 或直接 SQL 调整）。设置开启时
 > 密码登录需验证码，后端**不把验证码文本写进任何日志**，无人工介入的自动重登不成立。
 
+## daemon 保活（`hostbee daemon`）
+
+后端 refreshToken 为 **7 天固定 TTL、无滑动续期**（`hivelib-services/src/service/jwt.rs`），
+闲置 7 天后 CLI 只能靠密码重登兜底。daemon 用远小于 TTL 的周期（默认 `--interval 86400`
+= 每天一次）主动调 `refresh` 轮换并把新 token 对**原子落盘**，消除「闲置过期」；
+CLI 侧 401 → refresh → 密码重登的兜底路径保持不变（daemon 只消除闲置过期，不替代兜底）。
+
+### 运行语义（install vs foreground）
+
+| 场景 | 行为 |
+| --- | --- |
+| systemd 机器，`hostbee daemon` | 写 user unit → `systemctl --user daemon-reload` → `enable --now` → `try-restart` → 以 `is-active` 确认在跑 → stderr 提示后 **exit 0** |
+| systemd 机器，安装/启动失败 | 明确 stderr 日志后**降级前台循环**（服务确认 active 时不会双跑） |
+| 非 systemd（macOS/容器），`hostbee daemon` | 一条提示 `未检测到 systemd，前台保活运行；Ctrl-C 退出` 后直接前台循环 |
+| 任意环境，`--foreground` | 不走安装，直接前台循环——unit 的 ExecStart 即此形态，服务进程不会递归安装（防 fork-bomb） |
+
+- **unit 文件**：`~/.config/systemd/user/hostbee-keepalive.service`（`XDG_CONFIG_HOME`
+  优先）。内容（golden，随 `--interval` 变化）：
+
+  ```ini
+  # 由 hostbee daemon 自动生成；改动周期后重新运行 hostbee daemon 即可更新。
+  [Unit]
+  Description=hostbee keepalive——refreshToken 定期轮换
+  Wants=network-online.target
+  After=network-online.target
+
+  [Service]
+  Type=simple
+  ExecStart="<current_exe 绝对路径>" daemon --foreground --interval 86400
+  Restart=always
+  RestartSec=10s
+
+  [Install]
+  WantedBy=default.target
+  ```
+
+  - `ExecStart` 记录安装时的二进制绝对路径——**移动二进制后需重新运行 `hostbee daemon` 更新**；
+  - 安全设置按 ADR-0001 保持最小，不引入沙箱/加固指令：unit 归用户自己所有，与 CLI
+    进程同权限运行；
+  - `Restart=always` 只兜底真实崩溃（OOM、panic）；循环自身已对瞬态错误退避，正常
+    永不退出；凭据被清空时 daemon exit 1，journal 每 10s 一条明确报错（可见的运维信号）；
+  - **linger**：user unit 的「开机自启无需登录」需要 linger，安装时尽力执行
+    `loginctl enable-linger`，失败只提示不阻断（提示语含手动补救命令）。
+
+- **幂等重装**：unit 内容未变时只 `enable --now`，不动运行中的服务；内容变化时才写盘
+  + `daemon-reload` + `try-restart`（仅原本 active 时重启，让新 ExecStart 生效）。
+- **systemd 服务读不到安装现场的 flag/env**：bare `hostbee daemon` 要求 endpoint 与
+  凭据（refresh_token 或 contact+password）都在 `~/.hostbee/config.toml` 中——
+  只有 env/flag 提供时明确报错退出，不安装一个必然起不来的服务。env-only 场景
+  （CI、容器）请用 `--foreground`。
+
+### 轮换循环
+
+- 每轮**重新读盘**配置——配置文件是 daemon 与并发 CLI 的唯一共享事实，CLI 侧轮换后
+  daemon 自动跟进新值；
+- 依次尝试 refreshToken 候选（env > config，与 CLI 恢复路径同序），全部失败且存有
+  contact+password 时密码重登（复用 CLI 的 login_full，含 TOTP 自动交换），daemon 不
+  引入新恢复机制；
+- 成功 → 原子落盘（与 CLI 同一套写路径）；重登成功但未拿到新 refreshToken（账号未启用
+  TOTP）时明确警告：access token 约 10 分钟后过期，下轮须再次重登；
+- 首轮在启动时立即执行（重启即验证凭据可用，不等一个周期）。
+
+### 周期与退避
+
+- `--interval <secs>` 默认 86400；校验非 0，`interval >= 604800`（7 天 TTL）时启动
+  打警告（建议显著调小）但仍可运行。
+- **退避曲线**：连续失败从 `min(60s, interval)` 起指数加倍，封顶 `max(interval/4, 起始值)`，
+  成功即复位。默认配置下 60s → 2m → 4m → … → 6h 封顶：
+  - 封顶 interval/4 ⇒ 最坏重试节奏为每周期窗口 4 次，对失败中的后端压力有界；
+  - 60s 起步让短瞬断在分钟级内被下一次重试覆盖，而 7 天 TTL 给足重试余量；
+  - interval 本就小于 60s 时按其自身节奏退避（e2e/容器等小周期场景不被 60s 拖慢）。
+- **HTTP 超时**：daemon 单次调用整体超时 30s——后端挂起时退避重试而不是卡死循环
+  （CLI 单次命令不设超时，进程短生命周期语义不同）。
+
+### 退出与日志
+
+- **stdout 恒空**（daemon 无 stdout JSON 契约，可安全重定向）；全部日志走 stderr，
+  每行 `[UTC RFC3339] 消息`；
+- 致命错误（interval 为 0、缺 endpoint、无任何凭据）最后一行为一行 JSON
+  `{"errors":[...]}` 并 exit 1，与 CLI 错误契约一致；
+- SIGINT/SIGTERM：日志一行后**干净退出 exit 0**（systemd 停止服务、运维 Ctrl-C 同路径）；
+- 唯一非 0 退出条件：无任何可保活凭据（无 refreshToken 且无 contact+password）。
+
 ## 输出契约
 
 | 通道 | 成功 | 失败 |
@@ -136,14 +219,20 @@ e2e 测试完全 hermetic（内存 stub server），hook 不访问 localhost 以
 
 - **unit**（`cargo test --lib`）：endpoint 解析优先级、配置文件读取、GraphQL envelope
   分类、错误 JSON 格式化、token 生命周期状态机（extensions 401 判定、重试边界、
-  RFC 6238 TOTP 向量）、原子写语义等纯逻辑，与实现同文件放在 `#[cfg(test)]` 模块。
+  RFC 6238 TOTP 向量）、原子写语义等纯逻辑，与实现同文件放在 `#[cfg(test)]` 模块；
+  daemon/systemd 侧含 interval 校验、退避曲线、UTC 时间戳向量、保活轮状态机
+  （脚本化传输）、unit 文件 golden、systemd 检测/PATH 查找、假 systemctl 脚本驱动的
+  完整安装流程（幂等重装、失败汇总）。
 - **e2e**（`crates/hostbee/tests/e2e/`，`cargo test --test e2e`）：全仓库唯一的「高 seam」，
   进程边界测试。测试内起内存 stub GraphQL HTTP server（tiny_http，dev-dep），spawn
   编译好的真实二进制（`env!("CARGO_BIN_EXE_hostbee")`）指向它，断言 stdout JSON、
   exit code、stderr 错误 JSON 三通道；覆盖成功、GraphQL errors（含 400 + envelope）、
-  传输失败、endpoint 各来源与优先级、variables 透传与非法 JSON，以及认证闭环
+  传输失败、endpoint 各来源与优先级、variables 透传与非法 JSON，认证闭环
   （HB-AUTH 自动携带、access token 失效自动轮换重试、refresh 失效密码重登 + TOTP
-  交换、env 覆盖与兜底、全失效原样报错）等路径。
+  交换、env 覆盖与兜底、全失效原样报错），以及 daemon 保活（`--interval 1 --foreground`
+  连续轮换 + 轮换期间 CLI 全程可用 + SIGTERM 干净退出；stub 故障开关驱动的退避日志
+  与恢复自愈；非 systemd 环境的 bare daemon 降级前台循环；缺凭据 / interval 0 的
+  致命退出契约）等路径。
   子进程 `env_clear` 且 HOME 指向临时目录，与真实 `~/.hostbee/` 完全隔离。
 
 ## 仓库结构
@@ -152,11 +241,13 @@ e2e 测试完全 hermetic（内存 stub server），hook 不访问 localhost 以
 Cargo.toml               # workspace 根（resolver = 3）
 crates/hostbee/          # 唯一成员：hostbee CLI（lib + bin）
   src/
-    lib.rs               # 模块入口（endpoint / error / gql / auth / config）
+    lib.rs               # 模块入口（endpoint / error / gql / auth / config / daemon / systemd）
     main.rs              # 二进制入口：clap 解析 + stdin/stdout 编排
     auth.rs              # token 生命周期状态机（401 判定 / refresh 轮换 / 密码重登 / TOTP）
     config.rs            # ~/.hostbee/config.toml 读写（原子写）
-  tests/e2e/             # e2e harness（stub server + 三通道断言）
+    daemon.rs            # daemon 保活循环（周期轮换 / 退避 / 信号退出 / systemd 安装编排）
+    systemd.rs           # systemd user unit 生成与安装（检测 / PATH 查找 / systemctl 调用）
+  tests/e2e/             # e2e harness（stub server + 三通道断言 + daemon 子进程场景）
 .githooks/pre-push       # 质量门禁 hook
 vendor/                  # 后端与 webclient 子模块（只读参考，禁止修改）
 ```
