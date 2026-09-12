@@ -1,0 +1,5 @@
+[workspace]
+resolver = "3"
+members = ["crates/hostbee"]
+
+# 预留：schema codegen crate（ticket #4）将加入 members，落在 crates/ 下。
