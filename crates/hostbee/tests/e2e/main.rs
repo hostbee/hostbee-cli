@@ -933,3 +933,182 @@ fn daemon_interval_不小于_7天_tll_有警告仍继续检查凭据() {
     let message = json["errors"][0]["message"].as_str().unwrap();
     assert!(message.contains("凭据"), "应提示凭据缺失: {message}");
 }
+// ========== codegen 命令面（vm 领域 tracer，ticket #4） ==========
+
+use hostbee::generated::FIELDS;
+
+/// 注册表条目（e2e 直接引用生成产物常量，避免测试内复制 document 文本）。
+fn spec(command: &str) -> &'static hostbee::commands::FieldSpec {
+    FIELDS
+        .iter()
+        .find(|f| f.domain == "vm" && f.command == command)
+        .unwrap_or_else(|| panic!("注册表应有 vm/{command}"))
+}
+
+#[test]
+fn vm_查询_分页flags与_json_透传() {
+    let stub = GraphqlStub::echo();
+    let r = run_hostbee(
+        &[
+            "vm",
+            "vm-instances",
+            "--page-size",
+            "1",
+            "--page-num",
+            "2",
+            "--filter",
+            r#"{"hostname":"web-1"}"#,
+            "--endpoint",
+            stub.url(),
+        ],
+        &[],
+    );
+    assert_eq!(r.code, Some(0), "stderr: {}", r.stderr);
+    assert_eq!(r.stderr, "");
+    // 回显模式：data 里是 stub 收到的 query/variables，两侧都断言
+    let echoed: Value = serde_json::from_str(r.stdout.trim_end()).unwrap();
+    assert_eq!(echoed["query"], spec("vm-instances").documents[3]);
+    assert_eq!(
+        echoed["variables"],
+        serde_json::json!({"pageSize": 1, "pageNum": 2, "filter": {"hostname": "web-1"}})
+    );
+}
+
+#[test]
+fn vm_list_别名_默认参数可跑() {
+    let stub = GraphqlStub::echo();
+    // `vm list`（手写别名）+ 分页参数缺省：CLI 默认 25/1/{}，无参可跑
+    let r = run_hostbee(&["vm", "list", "--endpoint", stub.url()], &[]);
+    assert_eq!(r.code, Some(0), "stderr: {}", r.stderr);
+    let echoed: Value = serde_json::from_str(r.stdout.trim_end()).unwrap();
+    assert_eq!(echoed["query"], spec("vm-instances").documents[3]);
+    assert_eq!(
+        echoed["variables"],
+        serde_json::json!({"pageSize": 25, "pageNum": 1, "filter": {}})
+    );
+}
+
+#[test]
+fn vm_查询_depth_选档与_fields_覆盖() {
+    let stub = GraphqlStub::echo();
+    let r = run_hostbee(
+        &[
+            "vm",
+            "vm-instances",
+            "--depth",
+            "0",
+            "--endpoint",
+            stub.url(),
+        ],
+        &[],
+    );
+    assert_eq!(r.code, Some(0), "stderr: {}", r.stderr);
+    let echoed: Value = serde_json::from_str(r.stdout.trim_end()).unwrap();
+    assert_eq!(echoed["query"], spec("vm-instances").documents[0]);
+
+    let r = run_hostbee(
+        &[
+            "vm",
+            "vm-instances",
+            "--fields",
+            "{ nodes { id status } totalNum }",
+            "--endpoint",
+            stub.url(),
+        ],
+        &[],
+    );
+    assert_eq!(r.code, Some(0), "stderr: {}", r.stderr);
+    let echoed: Value = serde_json::from_str(r.stdout.trim_end()).unwrap();
+    assert_eq!(
+        echoed["query"],
+        format!(
+            "{} {{ nodes {{ id status }} totalNum }} }}",
+            spec("vm-instances").prefix
+        )
+    );
+}
+
+#[test]
+fn vm_mutation_json_透传() {
+    let stub = GraphqlStub::echo();
+    let r = run_hostbee(
+        &[
+            "vm",
+            "update-vm-instance",
+            "--input",
+            r#"{"id":608,"rootPassword":"new-pw"}"#,
+            "--endpoint",
+            stub.url(),
+        ],
+        &[],
+    );
+    assert_eq!(r.code, Some(0), "stderr: {}", r.stderr);
+    let echoed: Value = serde_json::from_str(r.stdout.trim_end()).unwrap();
+    assert_eq!(echoed["query"], spec("update-vm-instance").documents[3]);
+    // 必填输入对象整体 JSON 透传进 variables
+    assert_eq!(
+        echoed["variables"],
+        serde_json::json!({"input": {"id": 608, "rootPassword": "new-pw"}})
+    );
+}
+
+#[test]
+fn vm_命令_自动携带_hb_auth() {
+    let stub = GraphqlStub::canned(200, r#"{"data":{"vmInstances":{"totalNum":0}}}"#);
+    let home = TempDir::new().unwrap();
+    let home_str = write_config(
+        &home,
+        &format!(
+            "endpoint = \"{}\"\naccess_token = \"acc-e2e\"\n",
+            stub.url()
+        ),
+    );
+    let r = run_hostbee(&["vm", "vm-instances"], &[("HOME", home_str.as_str())]);
+    assert_eq!(r.code, Some(0), "stderr: {}", r.stderr);
+    assert_eq!(r.stdout, "{\"vmInstances\":{\"totalNum\":0}}\n");
+    let requests = stub.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].hb_auth.as_deref(), Some("acc-e2e"));
+}
+
+#[test]
+fn vm_命令_graphql_错误进_stderr_exit_非0() {
+    let stub = GraphqlStub::canned(
+        400,
+        r#"{"data":null,"errors":[{"message":"vmId 不存在","extensions":{"code":"vm.not_found"}}]}"#,
+    );
+    let r = run_hostbee(
+        &[
+            "vm",
+            "vm-instance-by-subscription",
+            "--subscription-id",
+            "99999",
+            "--endpoint",
+            stub.url(),
+        ],
+        &[],
+    );
+    assert_eq!(r.code, Some(1));
+    assert_eq!(r.stdout, "");
+    let json = r.stderr_json();
+    assert_eq!(json["errors"][0]["message"], "vmId 不存在");
+    assert_eq!(json["errors"][0]["extensions"]["code"], "vm.not_found");
+}
+
+#[test]
+fn vm_组_help_输出全命令面() {
+    let r = run_hostbee(&["vm", "--help"], &[]);
+    assert_eq!(r.code, Some(0));
+    // 组 help：命令面 + 别名可见（前缀发现）
+    assert!(r.stdout.contains("vm-instances"));
+    assert!(r.stdout.contains("vm-power-action"));
+    assert!(r.stdout.contains("[alias: list]"));
+    // 叶子 help：参数 flags 与运行时 flag（--depth/--fields/--endpoint）可见
+    let r = run_hostbee(&["vm", "vm-instances", "--help"], &[]);
+    assert_eq!(r.code, Some(0));
+    assert!(r.stdout.contains("--page-size"));
+    assert!(r.stdout.contains("--filter"));
+    assert!(r.stdout.contains("--depth"));
+    assert!(r.stdout.contains("--fields"));
+    assert!(r.stdout.contains("--endpoint"));
+}
