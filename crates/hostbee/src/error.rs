@@ -18,6 +18,8 @@ pub enum CliError {
     InvalidVariables(String),
     /// 配置文件存在但读取/解析失败。
     Config(String),
+    /// 命令输入错误（交互输入为空、缺少完成登录所需的信息等）。
+    Input(String),
     /// 服务端返回的 GraphQL errors 数组非空，原样携带。
     GraphQlErrors(Vec<Value>),
     /// HTTP 传输层失败（连接拒绝、DNS 解析失败、超时等）。
@@ -30,13 +32,14 @@ pub enum CliError {
 
 impl CliError {
     /// 合成 errors 元素用的人类可读 message。
-    fn message(&self) -> String {
+    pub(crate) fn message(&self) -> String {
         match self {
             CliError::NoEndpoint => "未提供 endpoint：请使用 --endpoint flag、\
                 HOSTBEE_ENDPOINT 环境变量，或在 ~/.hostbee/config.toml 写入 endpoint"
                 .to_owned(),
             CliError::InvalidVariables(err) => format!("--variables 不是合法 JSON: {err}"),
             CliError::Config(msg) => msg.clone(),
+            CliError::Input(msg) => msg.clone(),
             CliError::GraphQlErrors(errors) => {
                 format!("GraphQL 请求失败，服务端返回 {} 个 error", errors.len())
             }
