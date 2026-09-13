@@ -155,7 +155,7 @@ fn login_command() -> Command {
         .arg(
             Arg::new("totp-secret")
                 .long("totp-secret")
-                .value_name("HEX")
+                .value_name("BASE32")
                 .help(
                     "TOTP 密钥（Base32）；可选，用于自动验证；未提供时走邮件验证码，按 flag > \
                        HOSTBEE_TOTP_SECRET > 配置文件已有值解析",
