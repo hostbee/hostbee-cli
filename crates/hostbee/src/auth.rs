@@ -3,7 +3,7 @@
 //!
 //! 与后端（auth-flow 实测事实）对齐的关键行为：
 //! - `login` 只返回 10 分钟的 login token（`refreshToken` 恒为 null）；启用 TOTP 的账号
-//!   须再走一步 `verifyTotp(code)` 交换才能拿到真正的 access/refresh 对；
+//!   可用 `verifyTotp(code)` 或邮件 `verifyVerificationCode(input)` 交换完整 token 对；
 //! - `refresh` 同时轮换两个 token 并在服务端 revoke 旧 refreshToken——拿到新对后必须
 //!   **先原子落盘再重试**原请求（写盘失败 = 会话丢失）；
 //! - 认证失败**不是** HTTP 401：后端返回 HTTP 400/500 + GraphQL errors，其中
@@ -35,6 +35,9 @@ const REFRESH_DOCUMENT: &str = "mutation HostbeeRefresh($refreshToken: String) {
 
 const VERIFY_TOTP_DOCUMENT: &str = "mutation HostbeeVerifyTotp($code: String!) {\n  verifyTotp(code: $code) {\n    accessToken\n    refreshToken\n    userInfo { id email hasTotp hasPasskey emailVerified phoneVerified callingCode phoneNumber allowTicket }\n  }\n}";
 
+const SEND_CODE_DOCUMENT: &str = "mutation HostbeeSendVerificationCode { sendVerificationCode }";
+const VERIFY_CODE_DOCUMENT: &str = "mutation HostbeeVerifyVerificationCode($input: VerifyCodeInput!) { verifyVerificationCode(input: $input) { accessToken refreshToken userInfo { id email hasTotp hasPasskey emailVerified phoneVerified callingCode phoneNumber allowTicket } } }";
+
 /// login / refresh / verifyTotp 成功后提取出的 token 对（AuthOutput 同构）。
 #[derive(Debug, Clone)]
 pub struct AuthPair {
@@ -55,11 +58,13 @@ impl AuthPair {
         let access_token = output
             .get("accessToken")
             .and_then(Value::as_str)
+            .filter(|token| !token.trim().is_empty())
             .ok_or_else(|| CliError::InvalidResponse(format!("{field} 响应缺少 accessToken")))?
             .to_owned();
         let refresh_token = output
             .get("refreshToken")
             .and_then(Value::as_str)
+            .filter(|token| !token.trim().is_empty())
             .map(str::to_owned);
         let user_info = output.get("userInfo").filter(|v| !v.is_null()).cloned();
         Ok(AuthPair {
@@ -185,8 +190,7 @@ pub fn verify_totp<T: GraphqlTransport>(
     post_pair(transport, endpoint, Some(login_token), &body, "verifyTotp")
 }
 
-/// 完整密码登录：login →（账号启用 TOTP 时）本地生成验证码 → verifyTotp 交换。
-/// 非 TOTP 账号只得到 10 分钟 login token、没有 refreshToken（后端行为，无法绕过）。
+/// 无交互完整登录：缺少自动验证条件时提示手动 login，不发送邮件或读取输入。
 pub fn login_full<T: GraphqlTransport>(
     transport: &T,
     endpoint: &str,
@@ -194,19 +198,79 @@ pub fn login_full<T: GraphqlTransport>(
     password: &str,
     totp_secret: Option<&str>,
 ) -> Result<AuthPair, CliError> {
-    let pair = login(transport, endpoint, contact, password)?;
-    if !pair.has_totp() {
+    let pair = login_password(transport, endpoint, contact, password, totp_secret)?;
+    if pair.refresh_token.is_none() {
+        return Err(CliError::Config(
+            "自动登录未取得完整 token 对：请运行 hostbee login 完成邮件验证；\
+             TOTP 账号可配置 totp_secret 以支持自动重登"
+                .to_owned(),
+        ));
+    }
+    Ok(pair)
+}
+
+/// 显式 login：自动验证不足时发送邮件，再通过输入回调取得一次性验证码。
+/// 回调仅在邮件发送成功后调用；后台恢复只使用无交互的 login_full。
+pub fn login_with_email_verification<T: GraphqlTransport>(
+    transport: &T,
+    endpoint: &str,
+    contact: &str,
+    password: &str,
+    totp_secret: Option<&str>,
+    read_code: impl FnOnce() -> Result<String, CliError>,
+) -> Result<AuthPair, CliError> {
+    let pair = login_password(transport, endpoint, contact, password, totp_secret)?;
+    if pair.refresh_token.is_some() {
         return Ok(pair);
     }
-    let secret = totp_secret.ok_or_else(|| {
-        CliError::Config(
-            "账号启用了 TOTP，本机没有 totp_secret：请通过 --totp-secret flag、\
-             HOSTBEE_TOTP_SECRET 环境变量或配置文件提供，登录才能换取 token 对"
-                .to_owned(),
-        )
-    })?;
+    let body = gql::request_body(SEND_CODE_DOCUMENT, None);
+    let (status, text) = transport
+        .post(endpoint, Some(&pair.access_token), &body)
+        .map_err(CliError::Transport)?;
+    let data = gql::parse_response(status, &text)?;
+    if data.get("sendVerificationCode").and_then(Value::as_bool) != Some(true) {
+        return Err(CliError::InvalidResponse("邮件验证码未发送成功".to_owned()));
+    }
+    let code = read_code()?;
+    let body = gql::request_body(VERIFY_CODE_DOCUMENT, Some(json!({"input": {"code": code}})));
+    let pair = post_pair(
+        transport,
+        endpoint,
+        Some(&pair.access_token),
+        &body,
+        "verifyVerificationCode",
+    )?;
+    if pair.refresh_token.is_none() {
+        return Err(CliError::InvalidResponse(
+            "邮件验证响应缺少 refreshToken，登录未完成".to_owned(),
+        ));
+    }
+    Ok(pair)
+}
+
+/// 密码登录并尝试已有的 TOTP 自动验证；可能仍返回待邮件验证的 login token。
+fn login_password<T: GraphqlTransport>(
+    transport: &T,
+    endpoint: &str,
+    contact: &str,
+    password: &str,
+    totp_secret: Option<&str>,
+) -> Result<AuthPair, CliError> {
+    let pair = login(transport, endpoint, contact, password)?;
+    if pair.refresh_token.is_some() || !pair.has_totp() {
+        return Ok(pair);
+    }
+    let Some(secret) = totp_secret else {
+        return Ok(pair);
+    };
     let code = generate_totp(secret).map_err(CliError::Config)?;
-    verify_totp(transport, endpoint, &pair.access_token, &code)
+    let pair = verify_totp(transport, endpoint, &pair.access_token, &code)?;
+    if pair.refresh_token.is_none() {
+        return Err(CliError::InvalidResponse(
+            "TOTP 验证响应缺少 refreshToken，登录未完成".to_owned(),
+        ));
+    }
+    Ok(pair)
 }
 
 /// RFC 6238 TOTP：HMAC-SHA256、30 秒步长、6 位数字（与后端 totp 配置一致；
@@ -503,6 +567,132 @@ mod tests {
 
     // ---------- TOTP ----------
 
+    #[test]
+    fn 自动登录缺少完整凭据时提示交互登录且不发送邮件() {
+        for has_totp in [false, true] {
+            let transport = ScriptedTransport::new(&[(
+                200,
+                &pair_response("login", "login-only", None, has_totp),
+            )]);
+            let err = login_full(&transport, "http://stub", "user", "pw", None).unwrap_err();
+            assert!(err.message().contains("hostbee login"), "{}", err.message());
+            assert_eq!(transport.calls(), vec!["login|-|-"]);
+        }
+    }
+
+    #[test]
+    fn 密码登录已返回完整凭据时不再二次验证() {
+        for has_totp in [false, true] {
+            let transport = ScriptedTransport::new(&[(
+                200,
+                &pair_response("login", "access", Some("refresh"), has_totp),
+            )]);
+            let pair = login_with_email_verification(
+                &transport,
+                "http://stub",
+                "user",
+                "pw",
+                Some("invalid-secret"),
+                || panic!("完整凭据不应要求输入"),
+            )
+            .unwrap();
+            assert_eq!(pair.refresh_token.as_deref(), Some("refresh"));
+            assert_eq!(transport.calls(), vec!["login|-|-"]);
+        }
+    }
+
+    #[test]
+    fn 邮件发送失败不读取验证码() {
+        for (status, response) in [
+            (500, REVOKED_REFRESH),
+            (200, r#"{"data":{"sendVerificationCode":false}}"#),
+            (200, r#"{"data":{}}"#),
+        ] {
+            let transport = ScriptedTransport::new(&[
+                (200, &pair_response("login", "login-only", None, true)),
+                (status, response),
+            ]);
+            let result = login_with_email_verification(
+                &transport,
+                "http://stub",
+                "user",
+                "pw",
+                None,
+                || panic!("未成功发送邮件时不应读取验证码"),
+            );
+            assert!(result.is_err());
+        }
+    }
+
+    #[test]
+    fn 邮件验证码错误或过期透传后端错误() {
+        for message in ["Invalid verification code", "Verification code has expired"] {
+            let response = json!({"errors": [{"message": message}]}).to_string();
+            let transport = ScriptedTransport::new(&[
+                (200, &pair_response("login", "login-only", None, false)),
+                (200, r#"{"data":{"sendVerificationCode":true}}"#),
+                (200, &response),
+            ]);
+            let err = login_with_email_verification(
+                &transport,
+                "http://stub",
+                "user",
+                "pw",
+                None,
+                || Ok("123456".to_owned()),
+            )
+            .unwrap_err();
+            assert!(err.stderr_json().contains(message));
+        }
+    }
+
+    #[test]
+    fn 邮件输入中断不发验证请求() {
+        let transport = ScriptedTransport::new(&[
+            (200, &pair_response("login", "login-only", None, true)),
+            (200, r#"{"data":{"sendVerificationCode":true}}"#),
+        ]);
+        let err =
+            login_with_email_verification(&transport, "http://stub", "user", "pw", None, || {
+                Err(CliError::Input("输入已结束".to_owned()))
+            })
+            .unwrap_err();
+        assert!(err.message().contains("输入已结束"));
+        assert_eq!(transport.calls().len(), 2);
+    }
+
+    #[test]
+    fn 二次验证缺失或空凭据不得成功或改发邮件() {
+        for field in ["verifyTotp", "verifyVerificationCode"] {
+            for (access, refresh) in [
+                ("access", None),
+                ("access", Some("")),
+                ("", Some("refresh")),
+            ] {
+                let login_response = pair_response("login", "login-only", None, true);
+                let verified_response = pair_response(field, access, refresh, true);
+                let mut replies = vec![(200, login_response.as_str())];
+                let secret = if field == "verifyTotp" {
+                    Some("31323334353637383930")
+                } else {
+                    replies.push((200, r#"{"data":{"sendVerificationCode":true}}"#));
+                    None
+                };
+                replies.push((200, &verified_response));
+                let transport = ScriptedTransport::new(&replies);
+                let result = login_with_email_verification(
+                    &transport,
+                    "http://stub",
+                    "user",
+                    "pw",
+                    secret,
+                    || Ok("123456".to_owned()),
+                );
+                assert!(result.is_err(), "{field} 不完整凭据应失败");
+            }
+        }
+    }
+
     /// RFC 6238 Appendix B 的 SHA-256 测试向量（8 位值 mod 10^6 得 6 位）。
     #[test]
     fn hotp_与_rfc6238_sha256_向量一致() {
@@ -659,32 +849,23 @@ mod tests {
     }
 
     #[test]
-    fn refresh_失效_密码重登_重试一次成功() {
+    fn refresh_失效_非totp重登缺少完整凭据_不落盘不重试() {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("config.toml");
-        // 非 TOTP 账号：重登只拿到 login token，重试原请求用它（部分 resolver 接受）
         let mut session = session(&dir, Some("acc-old"), Some("ref-dead"), Some("pw"), None);
         let transport = ScriptedTransport::new(&[
             (400, UNAUTHORIZED),
             (500, REVOKED_REFRESH),
             (200, &pair_response("login", "acc-login", None, false)),
-            (200, r#"{"data":{"users":{"totalCount":1}}}"#),
         ]);
-        let result = execute(&transport, &mut session, "{ users { totalCount } }", None).unwrap();
-        assert_eq!(result, json!({"users": {"totalCount": 1}}));
+        let err = execute(&transport, &mut session, "{ users { totalCount } }", None).unwrap_err();
+        assert!(err.stderr_json().contains("hostbee login"));
         assert_eq!(
             transport.calls(),
-            vec![
-                "gql|acc-old|-",
-                "refresh|-|ref-dead",
-                "login|-|-",
-                "gql|acc-login|-"
-            ]
+            vec!["gql|acc-old|-", "refresh|-|ref-dead", "login|-|-"]
         );
-        let config = crate::config::read_config(&path).unwrap().unwrap();
-        assert_eq!(config.access_token.as_deref(), Some("acc-login"));
-        // 非 TOTP 重登拿不到新 refresh：旧值保留，不做无谓丢失
-        assert_eq!(config.refresh_token.as_deref(), Some("ref-dead"));
+        assert_eq!(session.access_token.as_deref(), Some("acc-old"));
+        assert!(!path.exists());
     }
 
     #[test]

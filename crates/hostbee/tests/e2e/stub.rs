@@ -28,6 +28,8 @@ pub struct CapturedRequest {
 }
 
 enum Mode {
+    /// 按请求顺序返回响应，覆盖多步流程中的外部故障。
+    Scripted(Mutex<std::collections::VecDeque<(u16, String)>>),
     /// 固定响应。
     Canned { status: u16, body: String },
     /// 回显 query / variables。
@@ -62,6 +64,7 @@ pub struct AuthState {
     pub login_count: u32,
     pub refresh_count: u32,
     pub totp_count: u32,
+    pub email_sent: bool,
 }
 
 pub struct GraphqlStub {
@@ -72,6 +75,9 @@ pub struct GraphqlStub {
 }
 
 impl GraphqlStub {
+    pub fn scripted(replies: Vec<(u16, String)>) -> Self {
+        Self::start(Mode::Scripted(Mutex::new(replies.into())))
+    }
     /// 固定响应的 stub。
     pub fn canned(status: u16, body: impl Into<String>) -> Self {
         Self::start(Mode::Canned {
@@ -95,6 +101,7 @@ impl GraphqlStub {
             login_count: 0,
             refresh_count: 0,
             totp_count: 0,
+            email_sent: false,
         }));
         let outage = Arc::new(AtomicBool::new(false));
         Self::start(Mode::Auth {
@@ -246,6 +253,11 @@ fn issue_pair(state: &mut AuthState) -> (String, String) {
 /// 按 mode 生成响应（认证模式模拟真实后端的 token 生命周期）。
 fn respond(mode: &Mode, body: &str, hb_auth: Option<&str>) -> (u16, String) {
     match mode {
+        Mode::Scripted(replies) => replies
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap_or_else(|| (500, shape::internal_error())),
         Mode::Canned { status, body } => (*status, body.clone()),
         Mode::Echo => {
             let parsed: Value = serde_json::from_str(body).unwrap_or(Value::Null);
@@ -296,6 +308,42 @@ fn respond(mode: &Mode, body: &str, hb_auth: Option<&str>) -> (u16, String) {
                 } else {
                     // 真实后端：错误密码被 normalize 成 500 internal_error
                     (500, shape::internal_error())
+                }
+            } else if query.contains("sendVerificationCode") {
+                if state.login_token.is_some() && hb_auth == state.login_token.as_deref() {
+                    state.email_sent = true;
+                    (
+                        200,
+                        json!({"data": {"sendVerificationCode": true}}).to_string(),
+                    )
+                } else {
+                    (400, shape::unauthorized())
+                }
+            } else if query.contains("verifyVerificationCode(") {
+                if state.login_token.is_none() || hb_auth != state.login_token.as_deref() {
+                    (400, shape::unauthorized())
+                } else if !state.email_sent
+                    || variables
+                        .and_then(|v| v.pointer("/input/code"))
+                        .and_then(Value::as_str)
+                        != Some("123456")
+                {
+                    (
+                        200,
+                        json!({"errors": [{"message": "Invalid verification code"}]}).to_string(),
+                    )
+                } else {
+                    state.email_sent = false;
+                    let (access, refresh) = issue_pair(&mut state);
+                    (
+                        200,
+                        shape::auth_output(
+                            "verifyVerificationCode",
+                            &access,
+                            Some(&refresh),
+                            config.has_totp,
+                        ),
+                    )
                 }
             } else if query.contains("verifyTotp(") {
                 // HB-AUTH 必须是当前 login token；验证码内容不校验——

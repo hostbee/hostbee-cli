@@ -88,11 +88,14 @@ hostbee login --endpoint http://127.0.0.1:8000 \
 
 - 登录后凭据**明文**持久化到 `~/.hostbee/config.toml`（ADR-0001：内网 agent 专用，
   不做任何加密/密钥环/警告）。文件不存在时自动创建。
-- **TOTP 账号**：后端 `login` 只返回 10 分钟的 login token，CLI 自动用本机生成的
-  验证码（RFC 6238 SHA-256）调 `verifyTotp` 交换出 access + refresh token 对；
-  `totp_secret` 明文存盘，密码重登路径因此可全程自动化。
-- **无 TOTP 账号拿不到 refreshToken**（后端行为，webclient 同样受限）：CLI 明确
-  提示，access token 10 分钟后过期且无法自动恢复。
+- **邮件验证码登录**：直接运行 `hostbee login`，输入 contact 和 password 后，CLI
+  发送邮件并提示输入验证码，通过 `verifyVerificationCode` 换取 access + refresh token 对。
+  启用或未启用 TOTP 的账号均支持；验证码只从 stdin 读取，不保存到配置文件。
+- **TOTP 自动验证**：账号启用 TOTP 且提供了 `totp_secret` 时，本地生成验证码
+  （RFC 6238 SHA-256）并调用 `verifyTotp`，不发送邮件。secret 无效或验证失败则报错。
+- **完成条件**：只有取得完整 token 对才保存登录凭据；密码登录已返回完整 token 对时
+  直接成功。邮件发送失败、验证码错误／过期、空输入或 EOF 均失败退出，保留已有配置。
+  交互提示走 stderr，stdout 成功时仍只输出一行 AuthOutput JSON。
 
 ### 配置文件布局
 
@@ -108,7 +111,7 @@ refresh_token = "<jwt>"
 写入全部走**原子写**（同目录临时文件 + fsync + rename），refresh 轮换落盘不会
 出现半更新状态。
 
-### token 生命周期（自动，无需人工介入）
+### token 生命周期与自动恢复边界
 
 每次 GraphQL 调用自动携带 `HB-AUTH: Bearer <accessToken>`：
 
@@ -117,7 +120,8 @@ refresh_token = "<jwt>"
    并撤销旧 refreshToken）→ 原子落盘 → **重试原请求一次**。
 2. refresh 也失败（token 撤销/过期，后端形状为 HTTP 500 `messages.internal_error`）
    → 用存储的 contact + password 重新 login（TOTP 账号自动完成 verifyTotp 交换）
-   → 原子落盘 → 再重试一次。
+   → 取得完整 token 对后原子落盘 → 再重试一次。
+   没有自动验证条件时，提示运行 `hostbee login` 完成邮件验证；普通查询不发邮件、不等待输入。
 3. 全部失败：exit code 非 0，stderr 一行 JSON（`errors` 含原始错误 + 恢复过程附注）。
 
 环境变量 `HOSTBEE_ENDPOINT`、`HOSTBEE_REFRESH_TOKEN` 覆盖配置文件；env 提供的
@@ -130,7 +134,7 @@ refreshToken 失效时自动回退到配置文件中的值兜底。
 ## daemon 保活（`hostbee daemon`）
 
 后端 refreshToken 为 **7 天固定 TTL、无滑动续期**（`hivelib-services/src/service/jwt.rs`），
-闲置 7 天后 CLI 只能靠密码重登兜底。daemon 用远小于 TTL 的周期（默认 `--interval 86400`
+闲置 7 天后 CLI 需要重新登录；有 TOTP secret 时可自动重登，否则需要交互邮件验证。daemon 用远小于 TTL 的周期（默认 `--interval 86400`
 = 每天一次）主动调 `refresh` 轮换并把新 token 对**原子落盘**，消除「闲置过期」；
 CLI 侧 401 → refresh → 密码重登的兜底路径保持不变（daemon 只消除闲置过期，不替代兜底）。
 
@@ -185,8 +189,8 @@ CLI 侧 401 → refresh → 密码重登的兜底路径保持不变（daemon 只
 - 依次尝试 refreshToken 候选（env > config，与 CLI 恢复路径同序），全部失败且存有
   contact+password 时密码重登（复用 CLI 的 login_full，含 TOTP 自动交换），daemon 不
   引入新恢复机制；
-- 成功 → 原子落盘（与 CLI 同一套写路径）；重登成功但未拿到新 refreshToken（账号未启用
-  TOTP）时明确警告：access token 约 10 分钟后过期，下轮须再次重登；
+- 成功 → 原子落盘（与 CLI 同一套写路径）；密码重登未取得完整 token 对时按失败退避，
+  提示运行 `hostbee login`，保留已有配置；daemon 不发送邮件、不读取 stdin。
 - 首轮在启动时立即执行（重启即验证凭据可用，不等一个周期）。
 
 ### 周期与退避
