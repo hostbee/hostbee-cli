@@ -97,6 +97,21 @@ hostbee login --endpoint http://127.0.0.1:8000 \
   直接成功。邮件发送失败、验证码错误／过期、空输入或 EOF 均失败退出，保留已有配置。
   交互提示走 stderr，stdout 成功时仍只输出一行 AuthOutput JSON。
 
+### 登录时的图形验证码（CAPTCHA）
+
+后端返回 `captcha.id_required` 时，`hostbee login` 自动获取验证码图片，打印临时
+图片的绝对路径，等待人工输入答案；验证成功后携带 `X-CAPTCHA-ID` 重试登录一次，
+再继续 TOTP 或邮件验证。无需额外参数，不能用 TOTP 代替图形验证码。
+
+stderr 为终端且 `TERM=xterm-kitty` 或存在 `KITTY_WINDOW_ID` 时，使用 Kitty 图形
+协议显示图片；处于 tmux/screen 或 stderr 重定向时只输出图片路径。图片始终落盘，
+显示失败也可手动打开；SSH 场景的图片位于远端，需自行取回查看。临时图片在此次
+验证码交互结束后清理。后端验证码有效期为 5 分钟，答案错误、凭证过期、空输入、
+EOF 或服务端限流均报错退出，重新运行 `hostbee login` 可重新获取图片。
+
+图片与提示写 stderr，stdout 保持 JSON；失败时原有配置不变。自动重登与 daemon
+不触发验证码交互：被 CAPTCHA 拦截时保留错误，由用户手动运行 `hostbee login`。
+
 TOTP 密钥直接填写 `otpauth://` 链接中 `secret` 参数的 **Base32** 值，不能填写整个链接。
 接受大小写、合法的尾部 `=` padding 或无 padding，并忽略首尾空白。
 配置字段、`HOSTBEE_TOTP_SECRET` 和 `--totp-secret` 使用相同规则。

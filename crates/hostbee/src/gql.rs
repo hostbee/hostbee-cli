@@ -52,18 +52,31 @@ pub trait GraphqlTransport {
 /// daemon 等常驻进程用 [`UreqTransport::with_timeout`] 限定，避免后端挂起卡死循环。
 pub struct UreqTransport {
     pub timeout: Option<std::time::Duration>,
+    login_captcha: Option<String>,
 }
 
 impl UreqTransport {
     /// CLI 默认：不设超时。
     pub const fn new() -> Self {
-        Self { timeout: None }
+        Self {
+            timeout: None,
+            login_captcha: None,
+        }
+    }
+
+    /// 已验证的 CAPTCHA 凭证只用于手写登录操作，不传给后续二次验证。
+    pub fn with_login_captcha(id: String) -> Self {
+        Self {
+            timeout: None,
+            login_captcha: Some(id),
+        }
     }
 
     /// 常驻进程用：单次调用整体超时（覆盖连接、响应与 body 读取全程）。
     pub const fn with_timeout(timeout: std::time::Duration) -> Self {
         Self {
             timeout: Some(timeout),
+            login_captcha: None,
         }
     }
 }
@@ -90,6 +103,13 @@ impl GraphqlTransport for UreqTransport {
             .build()
             .into();
         let mut request = agent.post(&url);
+        if body["query"]
+            .as_str()
+            .is_some_and(|q| q.starts_with("mutation HostbeeLogin("))
+            && let Some(id) = &self.login_captcha
+        {
+            request = request.header("X-CAPTCHA-ID", id);
+        }
         if let Some(token) = auth {
             request = request.header(AUTH_HEADER, format!("Bearer {token}"));
         }

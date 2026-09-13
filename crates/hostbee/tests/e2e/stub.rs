@@ -24,6 +24,7 @@ pub struct CapturedRequest {
     pub content_type: Option<String>,
     /// HB-AUTH 头（去掉 `Bearer ` 前缀后的裸值）；未携带为 None。
     pub hb_auth: Option<String>,
+    pub captcha_id: Option<String>,
     pub body: String,
 }
 
@@ -161,10 +162,16 @@ impl GraphqlStub {
                     .find(|h| h.field.equiv("HB-AUTH"))
                     .and_then(|h| h.value.as_str().strip_prefix("Bearer ").map(str::to_owned));
                 let mut body = String::new();
+                let captcha_id = request
+                    .headers()
+                    .iter()
+                    .find(|h| h.field.equiv("X-CAPTCHA-ID"))
+                    .map(|h| h.value.as_str().to_owned());
                 let _ = request.as_reader().read_to_string(&mut body);
                 shared.lock().unwrap().push(CapturedRequest {
                     content_type,
                     hb_auth: hb_auth.clone(),
+                    captcha_id,
                     body: body.clone(),
                 });
                 let (status, response_body) = respond(&mode, &body, hb_auth.as_deref());

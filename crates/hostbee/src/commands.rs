@@ -516,14 +516,25 @@ pub fn login_cmd(matches: &ArgMatches) -> Result<Value, CliError> {
     )
     .or(session.totp_secret.clone());
 
-    let pair = auth::login_with_email_verification(
-        &gql::UreqTransport::new(),
-        &session.endpoint,
-        &contact,
-        &password,
-        totp_secret.as_deref(),
-        || prompt_input("邮件验证码（已发送至账号邮箱）"),
-    )?;
+    let login = |transport: &gql::UreqTransport| {
+        auth::login_with_email_verification(
+            transport,
+            &session.endpoint,
+            &contact,
+            &password,
+            totp_secret.as_deref(),
+            || prompt_input("邮件验证码（已发送至账号邮箱）"),
+        )
+    };
+    let pair = match login(&gql::UreqTransport::new()) {
+        Err(error) if crate::captcha::required(&error) => {
+            let id = crate::captcha::solve(&gql::UreqTransport::new(), &session.endpoint, || {
+                prompt_input("图形验证码（打开图片后输入）")
+            })?;
+            login(&gql::UreqTransport::with_login_captcha(id))?
+        }
+        result => result?,
+    };
 
     persist_login(&session, &contact, &password, &totp_secret, &pair);
 

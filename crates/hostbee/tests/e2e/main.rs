@@ -1407,3 +1407,190 @@ fn 参数错误统一_json_而帮助版本成功() {
         assert!(!r.stdout.is_empty());
     }
 }
+
+fn captcha_required() -> (u16, String) {
+    (
+        400,
+        r#"{"errors":[{"message":"需要验证码 ID","extensions":{"code":"captcha.id_required"}}]}"#
+            .into(),
+    )
+}
+
+fn captcha_image() -> (u16, String) {
+    let pixels = image::RgbImage::from_pixel(200, 60, image::Rgb([255, 255, 255]));
+    let mut jpeg = std::io::Cursor::new(Vec::new());
+    pixels
+        .write_to(&mut jpeg, image::ImageFormat::Jpeg)
+        .unwrap();
+    (200, serde_json::json!({"data":{"generateCaptcha":{"captchaId":"challenge", "imageBase64":format!("data:image/jpeg;base64,{}", data_encoding::BASE64.encode(jpeg.get_ref()))}}}).to_string())
+}
+
+#[test]
+fn login_captcha_图片降级并携带凭证完成登录() {
+    for totp in [true, false] {
+        let mut replies = vec![captcha_required(), captcha_image(),
+            (200, r#"{"data":{"verifyCaptcha":{"captchaId":"verified"}}}"#.into()),
+            (200, serde_json::json!({"data":{"login":{"accessToken":"login-token","userInfo":{"hasTotp":totp}}}}).to_string()),
+        ];
+        let field = if totp {
+            "verifyTotp"
+        } else {
+            replies.push((200, r#"{"data":{"sendVerificationCode":true}}"#.into()));
+            "verifyVerificationCode"
+        };
+        replies.push((200, serde_json::json!({"data":{field:{"accessToken":"access","refreshToken":"refresh","userInfo":{"hasTotp":totp}}}}).to_string()));
+        let stub = GraphqlStub::scripted(replies);
+        let home = TempDir::new().unwrap();
+        let mut args = vec![
+            "login",
+            "--endpoint",
+            stub.url(),
+            "--contact",
+            STUB_CONTACT,
+            "--password",
+            STUB_PASSWORD,
+        ];
+        if totp {
+            args.extend(["--totp-secret", TOTP_BASE32]);
+        }
+        let r = run_hostbee_input(
+            &args,
+            &[
+                ("HOME", home.path().to_str().unwrap()),
+                ("TERM", "xterm-kitty"),
+            ],
+            "ABCDE\n123456\n",
+        );
+        assert_eq!(r.code, Some(0), "{}", r.stderr);
+        assert_eq!(
+            serde_json::from_str::<Value>(&r.stdout).unwrap()["refreshToken"],
+            "refresh"
+        );
+        assert!(r.stderr.contains("验证码图片："));
+        assert!(
+            !r.stderr.contains("\x1b_G"),
+            "重定向 stderr 不得输出 Kitty 控制码"
+        );
+        let requests = stub.requests();
+        assert_eq!(requests.len(), if totp { 5 } else { 6 });
+        for (index, req) in requests.iter().enumerate() {
+            assert_eq!(
+                req.captcha_id.as_deref(),
+                if index == 3 { Some("verified") } else { None }
+            );
+        }
+        assert_eq!(
+            serde_json::from_str::<Value>(&requests[2].body).unwrap()["variables"]["input"],
+            serde_json::json!({"captchaId":"challenge","answer":"ABCDE"})
+        );
+        assert_eq!(
+            read_config(home.path().to_str().unwrap())
+                .refresh_token
+                .as_deref(),
+            Some("refresh")
+        );
+    }
+}
+
+#[test]
+fn login_captcha_错误过期及输入中断不覆盖凭据() {
+    for mode in ["wrong", "expired", "eof", "empty", "generate", "missing"] {
+        let mut replies = vec![captcha_required()];
+        if mode == "generate" {
+            replies.push((429, r#"{"errors":[{"message":"限流","extensions":{"code":"CAPTCHA_RATE_LIMIT_EXCEEDED"}}]}"#.into()));
+        } else {
+            replies.push(captcha_image());
+            if mode == "wrong" {
+                replies.push((403, r#"{"errors":[{"message":"答案错误","extensions":{"code":"CAPTCHA_VERIFICATION_FAILED"}}]}"#.into()));
+            } else if mode == "missing" {
+                replies.push((200, r#"{"data":{"verifyCaptcha":{"captchaId":""}}}"#.into()));
+            } else if mode == "expired" {
+                replies.push((
+                    200,
+                    r#"{"data":{"verifyCaptcha":{"captchaId":"verified"}}}"#.into(),
+                ));
+                replies.push((400, r#"{"errors":[{"message":"凭证过期","extensions":{"code":"captcha.invalid_or_expired"}}]}"#.into()));
+            }
+        }
+        let stub = GraphqlStub::scripted(replies);
+        let home = TempDir::new().unwrap();
+        let path = home.path().join(".hostbee/config.toml");
+        config::write_config_atomic(
+            &path,
+            &Config {
+                access_token: Some("keep-access".into()),
+                refresh_token: Some("keep-refresh".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let input = match mode {
+            "eof" => "",
+            "empty" => "\n",
+            _ => "ABCDE\n",
+        };
+        let r = run_hostbee_input(
+            &[
+                "login",
+                "--endpoint",
+                stub.url(),
+                "--contact",
+                STUB_CONTACT,
+                "--password",
+                STUB_PASSWORD,
+            ],
+            &[("HOME", home.path().to_str().unwrap())],
+            input,
+        );
+        assert_eq!(r.code, Some(1), "{mode}: {}", r.stderr);
+        assert!(r.stdout.is_empty());
+        let last = r.stderr.lines().last().unwrap();
+        assert!(serde_json::from_str::<Value>(last).unwrap()["errors"].is_array());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(
+            stub.requests().len(),
+            match mode {
+                "expired" => 4,
+                "wrong" | "missing" => 3,
+                _ => 2,
+            }
+        );
+    }
+}
+
+#[test]
+fn 自动重登遇到_captcha_直接报错不交互() {
+    let stub = GraphqlStub::scripted(vec![
+        (
+            400,
+            r#"{"errors":[{"message":"未授权","extensions":{"status":401}}]}"#.into(),
+        ),
+        captcha_required(),
+    ]);
+    let home = TempDir::new().unwrap();
+    let path = home.path().join(".hostbee/config.toml");
+    config::write_config_atomic(
+        &path,
+        &Config {
+            endpoint: Some(stub.url().into()),
+            contact: Some(STUB_CONTACT.into()),
+            password: Some(STUB_PASSWORD.into()),
+            access_token: Some("expired".into()),
+            totp_secret: Some(TOTP_BASE32.into()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let before = std::fs::read(&path).unwrap();
+    let r = run_hostbee(
+        &["gql", "{ __typename }"],
+        &[("HOME", home.path().to_str().unwrap())],
+    );
+    assert_eq!(r.code, Some(1));
+    assert!(r.stdout.is_empty());
+    assert!(r.stderr_json()["errors"].is_array());
+    assert_eq!(stub.requests().len(), 2);
+    assert_eq!(attempt_count(&stub, "generateCaptcha"), 0);
+    assert_eq!(std::fs::read(path).unwrap(), before);
+}

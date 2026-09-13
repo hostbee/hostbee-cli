@@ -6,6 +6,7 @@
 //! （[`auth::execute`]：401 → refresh 轮换 → 密码重登）为全命令面共用。
 
 pub mod auth;
+pub mod captcha;
 pub mod commands;
 pub mod config;
 pub mod daemon;
