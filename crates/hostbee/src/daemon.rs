@@ -269,7 +269,7 @@ fn run_loop(cfg: LoopConfig) -> ExitCode {
                     }
                 }
                 if pair.refresh_token.is_none() {
-                    log("警告：本次重登未获得新 refreshToken（账号未启用 TOTP），\
+                    log("警告：本次响应未包含新 refreshToken，\
                          access token 约 10 分钟后过期，下轮须再次重登");
                 }
                 cfg.interval_secs
@@ -603,7 +603,7 @@ mod tests {
     }
 
     #[test]
-    fn 保活轮_refresh全失败_密码重登恢复_非totp保留旧refresh() {
+    fn 保活轮_邮件验证账号不能自动重登_提示登录且不发送邮件() {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("config.toml");
         let session = session(&dir, Some("ref-dead"), Some("pw"));
@@ -611,19 +611,12 @@ mod tests {
             (500, INTERNAL_ERROR),
             (200, &pair_response("login", "acc-login", None)),
         ]);
-        let outcome = refresh_cycle(&transport, &session);
-        assert!(matches!(
-            outcome,
-            CycleOutcome::Rotated {
-                via: RefreshVia::Relogin,
-                ..
-            }
-        ));
+        let CycleOutcome::Failed { notes } = refresh_cycle(&transport, &session) else {
+            panic!("缺少完整凭据时不应保活成功");
+        };
+        assert!(notes.iter().any(|note| note.contains("hostbee login")));
         assert_eq!(transport.calls(), vec!["refresh|ref-dead", "login|-"]);
-        let config = config::read_config(&path).unwrap().unwrap();
-        assert_eq!(config.access_token.as_deref(), Some("acc-login"));
-        // 非 TOTP 重登拿不到新 refresh：保留旧值，不做无谓丢失
-        assert_eq!(config.refresh_token.as_deref(), Some("ref-dead"));
+        assert!(!path.exists());
     }
 
     #[test]

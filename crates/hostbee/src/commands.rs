@@ -157,7 +157,7 @@ fn login_command() -> Command {
                 .long("totp-secret")
                 .value_name("HEX")
                 .help(
-                    "TOTP 密钥（hex）；TOTP 账号登录换取 token 对必需，缺省时按 flag > \
+                    "TOTP 密钥（hex）；可选，用于自动验证；未提供时走邮件验证码，按 flag > \
                        HOSTBEE_TOTP_SECRET > 配置文件已有值解析",
                 ),
         )
@@ -491,7 +491,7 @@ pub fn gql_cmd(matches: &ArgMatches) -> Result<Value, CliError> {
     )
 }
 
-/// `hostbee login`：密码登录（TOTP 账号自动完成 verifyTotp 交换），
+/// `hostbee login`：密码登录后通过已有 TOTP 密钥或交互邮件验证码完成验证，
 /// 凭据明文落盘，stdout 输出 AuthOutput 同构 JSON。
 pub fn login_cmd(matches: &ArgMatches) -> Result<Value, CliError> {
     let session = load_session(matches.get_one::<String>("endpoint").map(String::as_str))?;
@@ -516,22 +516,17 @@ pub fn login_cmd(matches: &ArgMatches) -> Result<Value, CliError> {
     )
     .or(session.totp_secret.clone());
 
-    let pair = auth::login_full(
+    let pair = auth::login_with_email_verification(
         &gql::UreqTransport::new(),
         &session.endpoint,
         &contact,
         &password,
         totp_secret.as_deref(),
+        || prompt_input("邮件验证码（已发送至账号邮箱）"),
     )?;
 
     persist_login(&session, &contact, &password, &totp_secret, &pair);
 
-    if pair.refresh_token.is_none() {
-        eprintln!(
-            "警告：未获取 refreshToken（账号未启用 TOTP，后端无交换路径）——\
-             access token 10 分钟后过期，无法自动恢复会话"
-        );
-    }
     Ok(pair.to_output())
 }
 
@@ -556,8 +551,7 @@ fn prompt_input(label: &str) -> Result<String, CliError> {
     let value = line.trim();
     if read == 0 || value.is_empty() {
         return Err(CliError::Input(format!(
-            "未输入 {label}：请通过 flag（--contact/--password/--totp-secret）、\
-             环境变量（{CONTACT_ENV}/{PASSWORD_ENV}/{TOTP_SECRET_ENV}）或 stdin 提供"
+            "未输入 {label}：请重新运行 hostbee login 并通过 stdin 提供该输入"
         )));
     }
     Ok(value.to_owned())

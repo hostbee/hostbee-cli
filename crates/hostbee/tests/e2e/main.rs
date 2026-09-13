@@ -38,14 +38,30 @@ impl RunResult {
 /// HOSTBEE_ENDPOINT 等环境变量也不会从测试进程泄漏；需要时通过 `envs` 显式注入
 /// （注入的 HOME 覆盖默认临时目录，用于配置文件相关用例）。
 fn run_hostbee(args: &[&str], envs: &[(&str, &str)]) -> RunResult {
+    run_hostbee_input(args, envs, "")
+}
+
+fn run_hostbee_input(args: &[&str], envs: &[(&str, &str)], input: &str) -> RunResult {
+    use std::io::Write;
+    use std::process::Stdio;
     let home = TempDir::new().expect("创建临时 HOME 失败");
-    let output = Command::new(env!("CARGO_BIN_EXE_hostbee"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_hostbee"))
         .args(args)
         .env_clear()
         .env("HOME", home.path())
         .envs(envs.iter().copied())
-        .output()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .expect("spawn hostbee 二进制失败");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(input.as_bytes())
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
     RunResult {
         code: output.status.code(),
         stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
@@ -368,42 +384,52 @@ fn login_totp_账号_自动完成交换_凭据明文落盘() {
 }
 
 #[test]
-fn login_非_totp_账号_警告且无_refresh_token() {
-    let stub = auth_stub(false);
-    let home = TempDir::new().unwrap();
-    let home_str = home.path().to_str().unwrap().to_owned();
-    let r = run_hostbee(
-        &[
-            "login",
-            "--contact",
-            STUB_CONTACT,
-            "--password",
-            STUB_PASSWORD,
-            "--endpoint",
-            stub.url(),
-        ],
-        &[("HOME", home_str.as_str())],
-    );
-    assert_eq!(r.code, Some(0));
-    let stdout: serde_json::Value = serde_json::from_str(r.stdout.trim_end()).unwrap();
-    assert_eq!(stdout["accessToken"], "login-token-1");
-    assert_eq!(stdout["refreshToken"], serde_json::Value::Null);
-    // 警告走 stderr 纯文本（stdout 契约不破）
-    assert!(r.stderr.contains("refreshToken"), "stderr: {}", r.stderr);
-    // 落盘：无 refresh_token，其余凭据齐全
-    let cfg = read_config(&home_str);
-    assert_eq!(cfg.access_token.as_deref(), Some("login-token-1"));
-    assert_eq!(cfg.refresh_token, None);
-    assert_eq!(cfg.contact.as_deref(), Some(STUB_CONTACT));
-    assert_eq!(cfg.password.as_deref(), Some(STUB_PASSWORD));
-    assert_eq!(cfg.endpoint.as_deref(), Some(stub.url()));
-    // stub：无 TOTP 交换
-    let state = stub.auth_state().unwrap();
-    assert_eq!((state.login_count, state.totp_count), (1, 0));
+fn login_邮件验证_启用或未启用_totp_均取得完整凭据() {
+    for has_totp in [true, false] {
+        let stub = auth_stub(has_totp);
+        let home = TempDir::new().unwrap();
+        let home_str = home.path().to_str().unwrap().to_owned();
+        let r = run_hostbee_input(
+            &[
+                "login",
+                "--contact",
+                STUB_CONTACT,
+                "--password",
+                STUB_PASSWORD,
+                "--endpoint",
+                stub.url(),
+            ],
+            &[("HOME", home_str.as_str())],
+            "123456\n",
+        );
+        assert_eq!(r.code, Some(0), "{}", r.stderr);
+        let stdout: serde_json::Value = serde_json::from_str(r.stdout.trim_end()).unwrap();
+        assert_eq!(stdout["accessToken"], "access-1");
+        assert_eq!(stdout["refreshToken"], "refresh-1");
+        assert!(r.stderr.contains("邮件验证码"), "{}", r.stderr);
+        assert_eq!(r.stdout.lines().count(), 1);
+        let cfg = read_config(&home_str);
+        assert_eq!(cfg.access_token.as_deref(), Some("access-1"));
+        assert_eq!(cfg.refresh_token.as_deref(), Some("refresh-1"));
+        assert_eq!(cfg.totp_secret, None);
+        assert_eq!(cfg.contact.as_deref(), Some(STUB_CONTACT));
+        assert_eq!(cfg.password.as_deref(), Some(STUB_PASSWORD));
+        assert_eq!(cfg.endpoint.as_deref(), Some(stub.url()));
+        // stub：无 TOTP 交换
+        let state = stub.auth_state().unwrap();
+        assert_eq!((state.login_count, state.totp_count), (1, 0));
+        let requests = stub.requests();
+        assert_eq!(requests.len(), 3);
+        for request in &requests[1..] {
+            assert_eq!(request.hb_auth.as_deref(), Some("login-token-1"));
+        }
+        let query = run_hostbee(&["gql", "{ me { id } }"], &[("HOME", &home_str)]);
+        assert_eq!(query.code, Some(0), "{}", query.stderr);
+    }
 }
 
 #[test]
-fn login_totp_账号缺本机密钥_报错_不落盘() {
+fn login_邮件验证码输入结束_报错且不落盘() {
     let stub = auth_stub(true);
     let home = TempDir::new().unwrap();
     let home_str = home.path().to_str().unwrap().to_owned();
@@ -421,17 +447,9 @@ fn login_totp_账号缺本机密钥_报错_不落盘() {
     );
     assert_eq!(r.code, Some(1));
     assert_eq!(r.stdout, "");
-    let json = r.stderr_json();
-    let messages: Vec<&str> = json["errors"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .filter_map(|e| e["message"].as_str())
-        .collect();
-    assert!(
-        messages.iter().any(|m| m.contains("totp_secret")),
-        "应提示 totp_secret: {messages:?}"
-    );
+    assert!(r.stderr.contains("未输入 邮件验证码"), "{}", r.stderr);
+    assert!(stub.auth_state().unwrap().email_sent);
+    assert_eq!(attempt_count(&stub, "verifyVerificationCode("), 0);
     assert!(
         !Path::new(&home_str)
             .join(".hostbee")
@@ -462,6 +480,116 @@ fn 登录后_gql_自动携带_hb_auth() {
     assert_eq!(requests[0].hb_auth, None);
     assert_eq!(requests[1].hb_auth.as_deref(), Some("login-token-1"));
     assert_eq!(requests[2].hb_auth.as_deref(), Some("access-1"));
+}
+
+#[test]
+fn login_邮件验证码错误或空输入_不覆盖已有配置() {
+    for input in ["000000\n", "\n", ""] {
+        let stub = auth_stub(true);
+        let home = TempDir::new().unwrap();
+        let original = format!(
+            "endpoint = \"{}\"\naccess_token = \"old-access\"\nrefresh_token = \"old-refresh\"\n",
+            stub.url()
+        );
+        let home_str = write_config(&home, &original);
+        let r = run_hostbee_input(
+            &[
+                "login",
+                "--contact",
+                STUB_CONTACT,
+                "--password",
+                STUB_PASSWORD,
+            ],
+            &[("HOME", &home_str)],
+            input,
+        );
+        assert_eq!(r.code, Some(1), "{}", r.stderr);
+        assert!(r.stdout.is_empty());
+        assert!(r.stderr.contains(if input == "000000\n" {
+            "Invalid verification code"
+        } else {
+            "未输入 邮件验证码"
+        }));
+        assert_eq!(
+            std::fs::read_to_string(home.path().join(".hostbee/config.toml")).unwrap(),
+            original
+        );
+        assert_eq!(attempt_count(&stub, "sendVerificationCode"), 1);
+        assert_eq!(
+            attempt_count(&stub, "verifyVerificationCode("),
+            usize::from(input == "000000\n")
+        );
+    }
+}
+
+#[test]
+fn login_邮件发送故障和过期及不完整响应_均保留已有配置() {
+    let login = serde_json::json!({"data": {"login": {"accessToken": "login-only", "refreshToken": null, "userInfo": {"hasTotp": true}}}}).to_string();
+    let sent = serde_json::json!({"data": {"sendVerificationCode": true}}).to_string();
+    for (responses, expected, requests) in [
+        (vec![(503, r#"{"errors":[{"message":"Mail unavailable"}]}"#.to_owned())], "Mail unavailable", 2),
+        (vec![(200, r#"{"data":{"sendVerificationCode":false}}"#.to_owned())], "未发送成功", 2),
+        (vec![(200, sent.clone()), (200, r#"{"errors":[{"message":"Verification code has expired"}]}"#.to_owned())], "Verification code has expired", 3),
+        (vec![(200, sent), (200, r#"{"data":{"verifyVerificationCode":{"accessToken":"partial","refreshToken":null}}}"#.to_owned())], "缺少 refreshToken", 3),
+    ] {
+        let mut replies = vec![(200, login.clone())];
+        replies.extend(responses);
+        let stub = GraphqlStub::scripted(replies);
+        let home = TempDir::new().unwrap();
+        let original = format!("endpoint = \"{}\"\naccess_token = \"old\"\n", stub.url());
+        let home_str = write_config(&home, &original);
+        let r = run_hostbee_input(
+            &["login", "--contact", STUB_CONTACT, "--password", STUB_PASSWORD],
+            &[("HOME", &home_str)], "123456\n",
+        );
+        assert_eq!(r.code, Some(1));
+        assert!(r.stdout.is_empty());
+        assert!(r.stderr.contains(expected), "{}", r.stderr);
+        assert_eq!(stub.requests().len(), requests);
+        assert_eq!(std::fs::read_to_string(home.path().join(".hostbee/config.toml")).unwrap(), original);
+    }
+}
+
+#[test]
+fn 邮件登录后_refresh可恢复_失效后查询不发邮件不覆盖凭据() {
+    let stub = auth_stub(false);
+    let home = TempDir::new().unwrap();
+    let home_str = home.path().to_str().unwrap();
+    let login = run_hostbee_input(
+        &[
+            "login",
+            "--contact",
+            STUB_CONTACT,
+            "--password",
+            STUB_PASSWORD,
+            "--endpoint",
+            stub.url(),
+        ],
+        &[("HOME", home_str)],
+        "123456\n",
+    );
+    assert_eq!(login.code, Some(0), "{}", login.stderr);
+    overwrite_config(home_str, |cfg| {
+        cfg.access_token = Some("expired".to_owned())
+    });
+    let query = run_hostbee(&["gql", "{ me { id } }"], &[("HOME", home_str)]);
+    assert_eq!(query.code, Some(0), "{}", query.stderr);
+    assert_eq!(
+        read_config(home_str).refresh_token.as_deref(),
+        Some("refresh-2")
+    );
+    overwrite_config(home_str, |cfg| {
+        cfg.access_token = Some("expired".to_owned());
+        cfg.refresh_token = Some("revoked".to_owned());
+    });
+    let path = home.path().join(".hostbee/config.toml");
+    let original = std::fs::read_to_string(&path).unwrap();
+    let query = run_hostbee(&["gql", "{ me { id } }"], &[("HOME", home_str)]);
+    assert_eq!(query.code, Some(1));
+    assert!(query.stdout.is_empty());
+    assert!(query.stderr_json().to_string().contains("hostbee login"));
+    assert_eq!(attempt_count(&stub, "sendVerificationCode"), 1);
+    assert_eq!(std::fs::read_to_string(path).unwrap(), original);
 }
 
 #[test]
@@ -892,6 +1020,62 @@ fn daemon_无任何凭据_致命退出_一行json错误() {
     let json = r.stderr_json();
     let message = json["errors"][0]["message"].as_str().unwrap();
     assert!(message.contains("凭据"), "应提示凭据缺失: {message}");
+}
+
+#[test]
+fn daemon_邮件验证账号恢复失败_退避且不发邮件不覆盖配置() {
+    let stub = auth_stub(true);
+    let home = TempDir::new().unwrap();
+    let original = format!(
+        "endpoint = \"{}\"\ncontact = \"{}\"\npassword = \"{}\"\naccess_token = \"old-access\"\nrefresh_token = \"revoked\"\n",
+        stub.url(),
+        STUB_CONTACT,
+        STUB_PASSWORD
+    );
+    let home_str = write_config(&home, &original);
+    let daemon = DaemonProc::spawn(
+        &["daemon", "--foreground", "--interval", "1"],
+        &[("HOME", &home_str)],
+    );
+    let failed = wait_until(Duration::from_secs(10), || {
+        daemon.stderr().contains("hostbee login")
+    });
+    let (status, stderr) = daemon.sigterm_and_wait(Duration::from_secs(5));
+    assert!(failed, "{stderr}");
+    assert_eq!(status.code(), Some(0), "{stderr}");
+    assert!(stderr.contains("退避"), "{stderr}");
+    assert_eq!(attempt_count(&stub, "sendVerificationCode"), 0);
+    assert_eq!(attempt_count(&stub, "verifyVerificationCode("), 0);
+    assert_eq!(
+        std::fs::read_to_string(home.path().join(".hostbee/config.toml")).unwrap(),
+        original
+    );
+}
+
+#[test]
+fn login_全交互读取账号密码邮件验证码() {
+    let stub = auth_stub(true);
+    let home = TempDir::new().unwrap();
+    let home_str = write_config(&home, &format!("endpoint = \"{}\"\n", stub.url()));
+    let r = run_hostbee_input(
+        &["login"],
+        &[("HOME", &home_str)],
+        &format!("{STUB_CONTACT}\n{STUB_PASSWORD}\n123456\n"),
+    );
+    assert_eq!(r.code, Some(0), "{}", r.stderr);
+    assert!(
+        r.stderr.contains("contact")
+            && r.stderr.contains("password")
+            && r.stderr.contains("邮件验证码")
+    );
+    assert_eq!(
+        serde_json::from_str::<Value>(&r.stdout).unwrap()["refreshToken"],
+        "refresh-1"
+    );
+    assert_eq!(
+        read_config(&home_str).refresh_token.as_deref(),
+        Some("refresh-1")
+    );
 }
 
 #[test]
