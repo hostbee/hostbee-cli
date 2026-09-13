@@ -6,7 +6,7 @@
 //! endpoint      = "http://127.0.0.1:8000"
 //! contact       = "admin@example.com"
 //! password      = "明文密码"
-//! totp_secret   = "TOTP 密钥 hex"
+//! totp_secret   = "TOTP 密钥 Base32"
 //! access_token  = "HB-AUTH 用的 access token"
 //! refresh_token = "refresh 轮换凭证"
 //! ```
@@ -117,7 +117,7 @@ mod tests {
 endpoint = "http://127.0.0.1:8000"
 contact = "admin@example.com"
 password = "p@ss\"wo\\rd"
-totp_secret = "6baf"
+totp_secret = "MZXW6"
 access_token = "acc"
 refresh_token = "ref"
 "#,
@@ -127,7 +127,7 @@ refresh_token = "ref"
         assert_eq!(config.contact.as_deref(), Some("admin@example.com"));
         // 密码含引号/反斜杠时 TOML 转义必须无损还原
         assert_eq!(config.password.as_deref(), Some("p@ss\"wo\\rd"));
-        assert_eq!(config.totp_secret.as_deref(), Some("6baf"));
+        assert_eq!(config.totp_secret.as_deref(), Some("MZXW6"));
         assert_eq!(config.access_token.as_deref(), Some("acc"));
         assert_eq!(config.refresh_token.as_deref(), Some("ref"));
     }

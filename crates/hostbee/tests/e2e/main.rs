@@ -291,8 +291,8 @@ use stub::{AuthStubConfig, CapturedRequest};
 
 const STUB_CONTACT: &str = "stub@hostbee.test";
 const STUB_PASSWORD: &str = "StubPass!123";
-/// RFC 6238 SHA-256 测试种子的 hex（stub 不校验验证码内容，CLI 侧须能从 hex 生成 6 位码）
-const TOTP_HEX: &str = "3132333435363738393031323334353637383930313233343536373839313232";
+/// RFC 6238 SHA-256 测试种子的 Base32（stub 不校验验证码内容；算法由 RFC 向量 unit test 验证）
+const TOTP_BASE32: &str = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQGEZA";
 
 fn auth_stub(has_totp: bool) -> GraphqlStub {
     GraphqlStub::auth(AuthStubConfig {
@@ -314,7 +314,7 @@ fn do_login(stub: &GraphqlStub) -> (TempDir, String, serde_json::Value) {
             "--password",
             STUB_PASSWORD,
             "--totp-secret",
-            TOTP_HEX,
+            TOTP_BASE32,
             "--endpoint",
             stub.url(),
         ],
@@ -351,6 +351,94 @@ fn attempt_count(stub: &GraphqlStub, needle: &str) -> usize {
 }
 
 #[test]
+fn login_base32_支持参数环境变量和配置文件() {
+    for source in ["flag", "env", "config"] {
+        let stub = auth_stub(true);
+        let home = TempDir::new().unwrap();
+        let home_str = home.path().to_str().unwrap();
+        let secret = format!(" \t{}====\n", TOTP_BASE32.to_ascii_lowercase());
+        let path = home.path().join(".hostbee/config.toml");
+        if source == "config" {
+            config::write_config_atomic(
+                &path,
+                &Config {
+                    totp_secret: Some(secret.clone()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        }
+        let mut args = vec![
+            "login",
+            "--endpoint",
+            stub.url(),
+            "--contact",
+            STUB_CONTACT,
+            "--password",
+            STUB_PASSWORD,
+        ];
+        let mut env = vec![("HOME", home_str)];
+        if source == "flag" {
+            args.extend(["--totp-secret", secret.as_str()]);
+        } else if source == "env" {
+            env.push(("HOSTBEE_TOTP_SECRET", secret.as_str()));
+        }
+        let r = run_hostbee(&args, &env);
+        assert_eq!(r.code, Some(0), "{source}: {}", r.stderr);
+        let output: serde_json::Value = serde_json::from_str(&r.stdout).unwrap();
+        assert_eq!(output["refreshToken"], "refresh-1");
+        assert_eq!(
+            read_config(home_str).totp_secret.as_deref(),
+            Some(secret.as_str())
+        );
+        assert_eq!(attempt_count(&stub, "sendVerificationCode("), 0);
+        let request = stub
+            .requests()
+            .into_iter()
+            .find(|r| r.body.contains("verifyTotp("))
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_str(&request.body).unwrap();
+        let code = body["variables"]["code"].as_str().unwrap();
+        assert_eq!(code.len(), 6);
+        assert!(code.bytes().all(|b| b.is_ascii_digit()));
+    }
+}
+
+#[test]
+fn login_非法_base32_不发送验证码或覆盖配置() {
+    for secret in ["31323334353637383930", "MZXW6=", "密钥"] {
+        let stub = auth_stub(true);
+        let (home, home_str, _) = do_login(&stub);
+        let path = home.path().join(".hostbee/config.toml");
+        let before = std::fs::read(&path).unwrap();
+        let r = run_hostbee(
+            &[
+                "login",
+                "--contact",
+                STUB_CONTACT,
+                "--password",
+                STUB_PASSWORD,
+                "--totp-secret",
+                secret,
+            ],
+            &[("HOME", &home_str)],
+        );
+        assert_eq!(r.code, Some(1));
+        assert!(r.stdout.is_empty());
+        let error = r.stderr_json();
+        assert!(
+            error["errors"][0]["message"]
+                .as_str()
+                .unwrap()
+                .contains("Base32")
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(attempt_count(&stub, "verifyTotp("), 1); // 仅 setup 登录
+        assert_eq!(attempt_count(&stub, "sendVerificationCode("), 0);
+    }
+}
+
+#[test]
 fn login_totp_账号_自动完成交换_凭据明文落盘() {
     let stub = auth_stub(true);
     let (home, home_str, stdout) = do_login(&stub);
@@ -366,7 +454,7 @@ fn login_totp_账号_自动完成交换_凭据明文落盘() {
     assert_eq!(cfg.endpoint.as_deref(), Some(stub.url()));
     assert_eq!(cfg.contact.as_deref(), Some(STUB_CONTACT));
     assert_eq!(cfg.password.as_deref(), Some(STUB_PASSWORD));
-    assert_eq!(cfg.totp_secret.as_deref(), Some(TOTP_HEX));
+    assert_eq!(cfg.totp_secret.as_deref(), Some(TOTP_BASE32));
     assert_eq!(cfg.access_token.as_deref(), Some("access-1"));
     assert_eq!(cfg.refresh_token.as_deref(), Some("refresh-1"));
 

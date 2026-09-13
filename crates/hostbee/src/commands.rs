@@ -157,7 +157,7 @@ fn login_command() -> Command {
                 .long("totp-secret")
                 .value_name("HEX")
                 .help(
-                    "TOTP 密钥（hex）；可选，用于自动验证；未提供时走邮件验证码，按 flag > \
+                    "TOTP 密钥（Base32）；可选，用于自动验证；未提供时走邮件验证码，按 flag > \
                        HOSTBEE_TOTP_SECRET > 配置文件已有值解析",
                 ),
         )

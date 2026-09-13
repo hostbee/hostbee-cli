@@ -10,6 +10,7 @@ clap = { version = "4", features = ["derive", "string"] }
 # daemon 的 SIGINT/SIGTERM 处理（termination feature 一并覆盖 SIGTERM/SIGHUP）：
 # 常驻循环收到信号后干净退出（exit 0），其余命令为短进程，不涉及
 ctrlc = { version = "3", features = ["termination"] }
+data-encoding = "2"
 # TOTP 计算（HMAC-SHA256）：refresh 失效后密码重登时对 TOTP 账号本地生成验证码
 hmac = "0.12"
 serde = { version = "1", features = ["derive"] }

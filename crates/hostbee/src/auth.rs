@@ -24,7 +24,7 @@ use crate::gql::{self, GraphqlTransport};
 pub const CONTACT_ENV: &str = "HOSTBEE_CONTACT";
 /// login 命令的 password 输入来源（flag > env > 交互输入）。
 pub const PASSWORD_ENV: &str = "HOSTBEE_PASSWORD";
-/// login 命令的 TOTP 密钥输入来源（hex；flag > env > 配置文件已有值）。
+/// login 命令的 TOTP 密钥输入来源（Base32；flag > env > 配置文件已有值）。
 pub const TOTP_SECRET_ENV: &str = "HOSTBEE_TOTP_SECRET";
 /// refreshToken 的配置文件覆盖（spec story 3：无文件系统写入场景用）。
 pub const REFRESH_TOKEN_ENV: &str = "HOSTBEE_REFRESH_TOKEN";
@@ -275,31 +275,25 @@ fn login_password<T: GraphqlTransport>(
 
 /// RFC 6238 TOTP：HMAC-SHA256、30 秒步长、6 位数字（与后端 totp 配置一致；
 /// ±3 步时钟容差由后端校验侧承担）。
-pub fn generate_totp(secret_hex: &str) -> Result<String, String> {
-    let secret = decode_hex(secret_hex)?;
+pub fn generate_totp(secret_base32: &str) -> Result<String, String> {
+    let text = secret_base32.trim().to_ascii_uppercase();
+    if text.is_empty() {
+        return Err("totp_secret 必须为非空 Base32".to_owned());
+    }
+    let encoding = if text.ends_with('=') {
+        data_encoding::BASE32
+    } else {
+        data_encoding::BASE32_NOPAD
+    };
+    let secret = encoding
+        .decode(text.as_bytes())
+        .map_err(|_| "totp_secret 必须为合法 Base32".to_owned())?;
     let counter = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_err(|e| format!("获取当前时间失败: {e}"))?
         .as_secs()
         / 30;
     Ok(hotp_sha256(&secret, counter))
-}
-
-/// hex 字符串解码为字节（TOTP 密钥存储格式）。
-fn decode_hex(text: &str) -> Result<Vec<u8>, String> {
-    let text = text.trim();
-    if !text.len().is_multiple_of(2) {
-        return Err(format!(
-            "totp_secret 长度必须为偶数（hex），实际 {}",
-            text.len()
-        ));
-    }
-    (0..text.len() / 2)
-        .map(|i| {
-            u8::from_str_radix(&text[i * 2..i * 2 + 2], 16)
-                .map_err(|_| "totp_secret 含非法 hex 字符".to_owned())
-        })
-        .collect()
 }
 
 /// RFC 4226 HOTP（SHA256 变体）：动态截断取低 31 位，模 10^6 补零到 6 位。
@@ -673,7 +667,7 @@ mod tests {
                 let verified_response = pair_response(field, access, refresh, true);
                 let mut replies = vec![(200, login_response.as_str())];
                 let secret = if field == "verifyTotp" {
-                    Some("31323334353637383930")
+                    Some("GEZDGNBVGY3TQOJQ")
                 } else {
                     replies.push((200, r#"{"data":{"sendVerificationCode":true}}"#));
                     None
@@ -706,20 +700,36 @@ mod tests {
     }
 
     #[test]
-    fn hex_解码_合法_奇数长_非法字符() {
-        assert_eq!(decode_hex("6baf").unwrap(), vec![0x6b, 0xaf]);
-        assert_eq!(decode_hex("").unwrap(), Vec::<u8>::new());
-        assert!(decode_hex("6ba").unwrap_err().contains("偶数"));
-        assert!(decode_hex("6bzz").unwrap_err().contains("hex"));
+    fn generate_totp_拒绝空值及非法_base32() {
+        for secret in [
+            "",
+            " \t\n",
+            "31323334353637383930",
+            "M",
+            "MZ",
+            "MZXW6=",
+            "MZ=XW6==",
+            "MZX W6",
+            "密钥",
+            "otpauth://totp/test?secret=MZXW6",
+        ] {
+            let err = generate_totp(secret).expect_err("非法 Base32 应拒绝");
+            assert!(err.contains("Base32"));
+        }
     }
 
     #[test]
-    fn generate_totp_返回_6_位数字() {
-        let code =
-            generate_totp("3132333435363738393031323334353637383930313233343536373839313232")
-                .unwrap();
+    fn generate_totp_接受大小写_padding_和首尾空白() {
+        for secret in ["MZXW6===", "mzxw6", " \tmZxW6===\r\n"] {
+            assert!(generate_totp(secret).is_ok(), "应接受 {secret:?}");
+        }
+    }
+
+    #[test]
+    fn generate_totp_接受_base32_密钥() {
+        let code = generate_totp("GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQGEZA").unwrap();
         assert_eq!(code.len(), 6);
-        assert!(code.chars().all(|c| c.is_ascii_digit()));
+        assert!(code.bytes().all(|byte| byte.is_ascii_digit()));
     }
 
     // ---------- 认证失败判定 ----------
@@ -877,7 +887,7 @@ mod tests {
             Some("acc-old"),
             Some("ref-dead"),
             Some("pw"),
-            Some("31323334353637383930"),
+            Some("GEZDGNBVGY3TQOJQ"),
         );
         let transport = ScriptedTransport::new(&[
             (400, UNAUTHORIZED),

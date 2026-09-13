@@ -82,7 +82,7 @@ document 原样 POST 到 `<endpoint>/graphql`（body 为 `{"query": doc, "variab
 
 ```sh
 hostbee login --endpoint http://127.0.0.1:8000 \
-  --contact 'user@example.com' --password 'secret' --totp-secret '<hex>'
+  --contact 'user@example.com' --password 'secret' --totp-secret '<Base32>'
 # flags 缺省时交互提示；HOSTBEE_CONTACT / HOSTBEE_PASSWORD / HOSTBEE_TOTP_SECRET 亦可
 ```
 
@@ -97,13 +97,20 @@ hostbee login --endpoint http://127.0.0.1:8000 \
   直接成功。邮件发送失败、验证码错误／过期、空输入或 EOF 均失败退出，保留已有配置。
   交互提示走 stderr，stdout 成功时仍只输出一行 AuthOutput JSON。
 
+TOTP 密钥直接填写 `otpauth://` 链接中 `secret` 参数的 **Base32** 值，不能填写整个链接。
+接受大小写、合法的尾部 `=` padding 或无 padding，并忽略首尾空白。
+配置字段、`HOSTBEE_TOTP_SECRET` 和 `--totp-secret` 使用相同规则。
+
+**迁移：不再支持 hex。** 已有 hex 配置必须替换为原始 Base32 密钥；不自动转换。
+部分 hex 字符串也符合 Base32 语法，会按 Base32 解码并产生不同验证码，不能依赖报错识别旧配置。
+
 ### 配置文件布局
 
 ```toml
 endpoint = "http://127.0.0.1:8000"
 contact = "user@example.com"
 password = "secret"                 # 密码重登兜底用
-totp_secret = "<hex>"               # 可选；TOTP 账号自动交换用
+totp_secret = "<Base32>"               # 可选；TOTP 账号自动交换用
 access_token = "<jwt>"
 refresh_token = "<jwt>"
 ```
